@@ -45,6 +45,7 @@ num_cpus = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
+pqcrypto-falcon = { workspace = true }
 solana-clock = { workspace = true, optional = true }
 solana-frozen-abi = { workspace = true, optional = true, features = [
     "frozen-abi",

@@ -72,6 +72,7 @@ log = { workspace = true }
 min-max-heap = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
+pqcrypto-falcon = { workspace = true }
 prio-graph = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true }

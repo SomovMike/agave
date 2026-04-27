@@ -208,13 +208,17 @@ impl TransactionClient for TpuClientNextClient {
         wire_transactions: Vec<Vec<u8>>,
         stats: &SendTransactionServiceStats,
     ) {
+        let tx_count = wire_transactions.len();
+        warn!("[PQC-TRACE] TpuClientNext: send_transactions_in_batch count={}", tx_count);
         let mut measure = Measure::start("send-us");
         self.runtime_handle.spawn({
             let sender = self.sender.clone();
             async move {
                 let res = sender.send(TransactionBatch::new(wire_transactions)).await;
                 if res.is_err() {
-                    warn!("Failed to send transaction to channel: it is closed.");
+                    warn!("[PQC-TRACE] TpuClientNext: FAILED to send to QUIC channel (closed)");
+                } else {
+                    warn!("[PQC-TRACE] TpuClientNext: successfully sent {} txs to QUIC channel", tx_count);
                 }
             }
         });

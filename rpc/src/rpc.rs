@@ -2722,6 +2722,8 @@ fn _send_transaction(
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
+    let wire_len = wire_transaction.len();
+    let first_byte = wire_transaction.first().copied().unwrap_or(0);
     let transaction_info = TransactionInfo::new(
         message_hash,
         signature,
@@ -2732,6 +2734,8 @@ fn _send_transaction(
         max_retries,
         None,
     );
+    warn!("[PQC-TRACE] _send_transaction: enqueuing to SendTransactionService, wire_len={}, first_byte=0x{:02x}, sig={}",
+        wire_len, first_byte, signature);
     meta.transaction_sender
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
@@ -3858,6 +3862,12 @@ pub mod rpc_full {
             let (wire_transaction, unsanitized_tx) =
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
 
+            warn!("[PQC-TRACE] RPC send_transaction: wire_len={}, first_byte=0x{:02x}, skip_preflight={}, version={:?}",
+                wire_transaction.len(),
+                wire_transaction.first().copied().unwrap_or(0),
+                skip_preflight,
+                unsanitized_tx.version());
+
             let preflight_commitment = if skip_preflight {
                 Some(CommitmentConfig::processed())
             } else {
@@ -3972,6 +3982,8 @@ pub mod rpc_full {
                 }
             }
 
+            warn!("[PQC-TRACE] RPC send_transaction: preflight passed, calling _send_transaction sig={}",
+                signature);
             _send_transaction(
                 meta,
                 message_hash,

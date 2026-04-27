@@ -231,6 +231,10 @@ impl SendTransactionService {
                         Err(RecvTimeoutError::Timeout) => {}
                         Ok(transaction_info) => {
                             stats.received_transactions.fetch_add(1, Ordering::Relaxed);
+                            warn!("[PQC-TRACE] SendTxService: received tx sig={}, wire_len={}, first_byte=0x{:02x}",
+                                transaction_info.signature,
+                                transaction_info.wire_transaction.len(),
+                                transaction_info.wire_transaction.first().copied().unwrap_or(0));
                             let entry = transactions.entry(transaction_info.signature);
                             let mut new_transaction = false;
                             if let Entry::Vacant(_) = entry {
@@ -262,6 +266,12 @@ impl SendTransactionService {
                             .values()
                             .map(|transaction_info| transaction_info.wire_transaction.clone())
                             .collect::<Vec<Vec<u8>>>();
+                        warn!("[PQC-TRACE] SendTxService: sending batch of {} txs to TPU via QUIC",
+                            wire_transactions.len());
+                        for (i, wt) in wire_transactions.iter().enumerate() {
+                            warn!("[PQC-TRACE] SendTxService: batch[{}] wire_len={}, first_byte=0x{:02x}",
+                                i, wt.len(), wt.first().copied().unwrap_or(0));
+                        }
                         client.send_transactions_in_batch(wire_transactions, stats);
                         let last_sent_time = Instant::now();
                         {
