@@ -8,5 +8,10 @@ rustflags = ["-Clinker-plugin-lto=no"]
 [target.x86_64-apple-darwin]
 rustflags = ["-Clinker-plugin-lto=no"]
 
+[env]
+CC = { value = "/usr/bin/cc", force = true }
+CXX = { value = "/usr/bin/c++", force = true }
+AR = { value = "/usr/bin/ar", force = true }
+
 [alias]
 xtask = "run --manifest-path ci/xtask/Cargo.toml --bin xtask --"
