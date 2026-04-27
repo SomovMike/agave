@@ -70,7 +70,7 @@ impl Bank {
         collect_processed_slots: bool,
         error_counters: &mut TransactionErrorMetrics,
     ) -> (Vec<TransactionCheckResult>, Option<Vec<Option<Slot>>>) {
-        let lock_results = self.filter_v1_transactions(sanitized_txs, lock_results);
+        let lock_results = lock_results.to_vec();
 
         let lock_results = self.check_age_and_compute_budget_limits(
             sanitized_txs,

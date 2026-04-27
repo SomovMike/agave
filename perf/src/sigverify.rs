@@ -10,6 +10,7 @@ use {
         transaction_data::TransactionData, transaction_version::TransactionVersion,
         transaction_view::SanitizedTransactionView,
     },
+    log::warn,
     rayon::prelude::*,
 };
 
@@ -58,12 +59,17 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
 
     let (is_simple_vote_tx, verified) = {
         let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, true) else {
+            if data.first() == Some(&0x81) {
+                warn!("[PQC-DEBUG] V1 tx sanitization FAILED, data len={}, first bytes={:02x?}",
+                    data.len(), &data[..data.len().min(8)]);
+            }
             return false;
         };
 
-        // Discard v1 transactions until support is added.
         if matches!(view.version(), TransactionVersion::V1) {
-            return false;
+            let msg = view.message_data();
+            warn!("[PQC-DEBUG] V1 tx parsed OK: data_len={}, msg_len={}, sigs={}, keys={}",
+                data.len(), msg.len(), view.signatures().len(), view.static_account_keys().len());
         }
 
         let is_simple_vote_tx = is_simple_vote_transaction_view(&view);
@@ -80,6 +86,9 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
                     .iter()
                     .zip(static_account_keys.iter())
                     .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message));
+                if matches!(view.version(), TransactionVersion::V1) {
+                    warn!("[PQC-DEBUG] V1 sig verify result: {}", verified);
+                }
                 (is_simple_vote_tx, verified)
             }
         }
@@ -693,5 +702,14 @@ mod tests {
             sigverify::verify_packet(&mut packet.as_mut(), false),
             !too_many_ixs
         );
+    }
+
+    #[test]
+    fn test_falcon_crypto_basic() {
+        use pqcrypto_falcon::falcon512::*;
+        let (pk, sk) = keypair();
+        let msg = b"Hello Falcon PQC!";
+        let sig = detached_sign(msg, &sk);
+        assert!(verify_detached_signature(&sig, msg, &pk).is_ok());
     }
 }

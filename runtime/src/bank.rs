@@ -4962,11 +4962,6 @@ impl Bank {
         tx: VersionedTransaction,
         verification_mode: TransactionVerificationMode,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        // Discard v1 transactions until support is added.
-        if tx.version() == TransactionVersion::Number(1) {
-            return Err(TransactionError::UnsupportedVersion);
-        }
-
         let serialized_message = tx.message.serialize();
         self.verify_transaction_with_serialized_message(tx, &serialized_message, verification_mode)
     }
@@ -4983,11 +4978,6 @@ impl Bank {
         serialized_message: &[u8],
         verification_mode: TransactionVerificationMode,
     ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
-        // Discard v1 transactions until support is added.
-        if tx.version() == TransactionVersion::Number(1) {
-            return Err(TransactionError::UnsupportedVersion);
-        }
-
         let enable_instruction_account_limit =
             self.feature_set.snapshot().limit_instruction_accounts;
 
