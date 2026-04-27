@@ -321,6 +321,7 @@ prio-graph = "0.3.0"
 proptest = "1.11"
 prost = "0.14.3"
 prost-types = "0.14.3"
+pqcrypto-falcon = "0.3.0"
 protobuf-src = "1.1.0"
 qualifier_attr = { version = "0.2.2", default-features = false }
 quinn = "0.11.9"
@@ -624,3 +625,4 @@ codegen-units = 1
 [patch.crates-io]
 # for details, see https://github.com/anza-xyz/crossbeam/commit/fd279d707025f0e60951e429bf778b4813d1b6bf
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d707025f0e60951e429bf778b4813d1b6bf" }
+solana-transaction = { path = "solana-transaction-patched" }

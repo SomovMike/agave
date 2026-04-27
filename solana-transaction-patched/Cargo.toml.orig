@@ -1,0 +1,81 @@
+[package]
+name = "solana-transaction"
+description = "Solana transaction-types"
+documentation = "https://docs.rs/solana-transaction"
+version = "4.1.0"
+rust-version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[features]
+blake3 = ["solana-message/blake3", "wincode"]
+dev-context-only-utils = ["blake3", "serde", "verify", "solana-hash/atomic"]
+frozen-abi = [
+    "dep:solana-frozen-abi",
+    "dep:solana-frozen-abi-macro",
+    "solana-transaction-error/frozen-abi",
+    "solana-signature/frozen-abi",
+    "solana-message/frozen-abi",
+]
+serde = [
+    "dep:serde",
+    "dep:serde_derive",
+    "dep:solana-short-vec",
+    "solana-message/serde",
+    "solana-signature/serde",
+    "solana-transaction-error/serde",
+    "solana-short-vec/serde",
+]
+verify = ["blake3", "solana-signature/verify"]
+wincode = [
+    "dep:solana-signer",
+    "dep:wincode",
+    "solana-message/wincode",
+    "solana-signature/wincode",
+]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_derive = { workspace = true, optional = true }
+solana-address = { workspace = true }
+solana-frozen-abi = { workspace = true, optional = true, features = ["frozen-abi"] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = ["frozen-abi"] }
+solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
+solana-instruction-error = { workspace = true }
+solana-message = { workspace = true }
+solana-sanitize = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-short-vec = { workspace = true, optional = true }
+solana-signature = { workspace = true }
+solana-signer = { workspace = true, optional = true }
+solana-transaction-error = { workspace = true }
+wincode = { workspace = true, optional = true, features = ["solana-short-vec", "alloc"] }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+bincode = { workspace = true }
+borsh = { workspace = true }
+proptest = { workspace = true }
+solana-example-mocks = { path = "../example-mocks" }
+solana-hash = { workspace = true, features = ["atomic"] }
+solana-instruction = { workspace = true, features = ["borsh"] }
+solana-keypair = { workspace = true }
+solana-nonce = { workspace = true }
+solana-packet = { workspace = true }
+solana-presigner = { workspace = true }
+solana-pubkey = { workspace = true, features = ["rand"] }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
+solana-system-interface = { workspace = true, features = ["bincode"] }
+solana-transaction = { path = ".", features = ["dev-context-only-utils", "wincode"] }
+solana-vote-interface = { workspace = true, features = ["bincode"] }
+static_assertions = { workspace = true }
+test-case = { workspace = true }
