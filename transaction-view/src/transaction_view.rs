@@ -195,6 +195,26 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     pub fn into_inner_data(self) -> D {
         self.data
     }
+
+    /// Returns `true` if this is a PQC transaction (V1 with config mask bit 5).
+    #[inline]
+    pub fn has_pqc(&self) -> bool {
+        self.frame.pqc_frame().present
+    }
+
+    /// Return the 897-byte Falcon public key, or `None` for non-PQC transactions.
+    #[inline]
+    pub fn pqc_pubkey_bytes(&self) -> Option<&[u8]> {
+        // SAFETY: `frame` was created from `data`.
+        unsafe { self.frame.pqc_pubkey_bytes(self.data()) }
+    }
+
+    /// Return the actual Falcon signature bytes, or `None` for non-PQC transactions.
+    #[inline]
+    pub fn pqc_signature_bytes(&self) -> Option<&[u8]> {
+        // SAFETY: `frame` was created from `data`.
+        unsafe { self.frame.pqc_signature_bytes(self.data()) }
+    }
 }
 
 // Implementation that relies on sanitization checks having been run.

@@ -34,8 +34,29 @@ pub(crate) struct TransactionFrame {
     address_table_lookup: AddressTableLookupFrame,
     /// Transaction config framing data
     transaction_config_frame: TransactionConfigFrame,
+    /// PQC signature framing data (only for V1 transactions with PQC bit set).
+    pqc_frame: PqcFrame,
     /// The data length in bytes
     data_len: u16,
+}
+
+/// Framing data for the PQC (Falcon-512) signer in a V1 transaction.
+///
+/// When the PQC config mask bit is set, the first "signer slot" in the
+/// signature section is replaced by:
+///   `[2B sig_len_le16][897B falcon_pubkey][666B falcon_sig_padded]`
+///
+/// For non-PQC transactions all fields are zero.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PqcFrame {
+    /// Offset of the 2-byte LE actual-signature-length prefix.
+    pub(crate) sig_len_offset: u16,
+    /// Offset of the 897-byte Falcon public key.
+    pub(crate) pubkey_offset: u16,
+    /// Offset of the 666-byte Falcon signature (padded).
+    pub(crate) sig_offset: u16,
+    /// Whether PQC data is present.
+    pub(crate) present: bool,
 }
 
 impl TransactionFrame {
@@ -86,6 +107,7 @@ impl TransactionFrame {
             instructions,
             address_table_lookup,
             transaction_config_frame: TransactionConfigFrame::not_applicable(),
+            pqc_frame: PqcFrame::default(),
             data_len: offset as u16,
         })
     }
@@ -142,21 +164,64 @@ impl TransactionFrame {
         )?;
         // instruction headers and payloads
         let instructions = InstructionsFrame::try_new_for_v1(bytes, &mut offset, num_instructions)?;
-        // signatures
-        let signatures_offset = offset as u16;
-        advance_offset_for_array::<Signature>(
-            bytes,
-            &mut offset,
-            u16::from(num_required_signatures),
-        )?;
+
+        // signatures — PQC transactions replace the first signer slot
+        let has_pqc = transaction_config_frame.has_pqc();
+        let mut pqc_frame = PqcFrame::default();
+        let signatures_offset;
+
+        if has_pqc {
+            // PQC signer 0: [2B sig_len][897B falcon_pubkey][666B falcon_sig_padded]
+            const PQC_WIRE_LEN: usize = 2 + 897 + 666; // = 1565
+            check_remaining(bytes, offset, PQC_WIRE_LEN)?;
+
+            let sig_len_offset = offset as u16;
+            let pubkey_offset = (offset + 2) as u16;
+            let sig_offset = (offset + 2 + 897) as u16;
+            offset = offset.wrapping_add(PQC_WIRE_LEN);
+
+            pqc_frame = PqcFrame {
+                sig_len_offset,
+                pubkey_offset,
+                sig_offset,
+                present: true,
+            };
+
+            // The SignatureFrame for downstream (PoH, txid) will point to
+            // right after the PQC blob — where Ed25519 co-signers start.
+            signatures_offset = offset as u16;
+
+            // Remaining Ed25519 co-signers (if any)
+            if num_required_signatures > 1 {
+                advance_offset_for_array::<Signature>(
+                    bytes,
+                    &mut offset,
+                    u16::from(num_required_signatures - 1),
+                )?;
+            }
+        } else {
+            signatures_offset = offset as u16;
+            advance_offset_for_array::<Signature>(
+                bytes,
+                &mut offset,
+                u16::from(num_required_signatures),
+            )?;
+        }
+
         // Verify that the entire transaction was parsed.
         if offset != bytes.len() {
             return Err(TransactionViewError::ParseError);
         }
 
+        let num_ed25519_sigs = if has_pqc {
+            num_required_signatures.saturating_sub(1)
+        } else {
+            num_required_signatures
+        };
+
         let frame = Self {
             signature: SignatureFrame {
-                num_signatures: num_required_signatures,
+                num_signatures: num_ed25519_sigs,
                 offset: signatures_offset,
             },
             message_header: MessageHeaderFrame {
@@ -167,12 +232,11 @@ impl TransactionFrame {
                 num_readonly_unsigned_accounts,
             },
             static_account_keys: StaticAccountKeysFrame {
-                num_static_accounts: num_addresses, // always static accounts in txv1
+                num_static_accounts: num_addresses,
                 offset: addresses_offset,
             },
             recent_blockhash_offset,
             instructions,
-            // Don't have ATL in txv1
             address_table_lookup: AddressTableLookupFrame {
                 num_address_table_lookups: 0,
                 offset: 0,
@@ -180,6 +244,7 @@ impl TransactionFrame {
                 total_readonly_lookup_accounts: 0,
             },
             transaction_config_frame,
+            pqc_frame,
             data_len: offset as u16,
         };
 
@@ -261,6 +326,10 @@ impl TransactionFrame {
     #[inline]
     pub(crate) fn message_range(&self) -> (u16, u16) {
         let end = match self.version() {
+            TransactionVersion::V1 if self.pqc_frame.present => {
+                // Message ends where the PQC blob starts
+                self.pqc_frame.sig_len_offset
+            }
             TransactionVersion::V1 => self.signature.offset,
             _ => self.data_len,
         };
@@ -271,6 +340,12 @@ impl TransactionFrame {
     #[inline]
     pub(crate) fn transaction_config_frame(&self) -> &TransactionConfigFrame {
         &self.transaction_config_frame
+    }
+
+    /// Return the PQC framing data.
+    #[inline]
+    pub(crate) fn pqc_frame(&self) -> &PqcFrame {
+        &self.pqc_frame
     }
 }
 
@@ -394,6 +469,38 @@ impl TransactionFrame {
             num_address_table_lookups: self.address_table_lookup.num_address_table_lookups,
             index: 0,
         }
+    }
+
+    /// Return the 897-byte Falcon public key from a PQC transaction.
+    /// Returns `None` if this is not a PQC transaction.
+    /// # Safety
+    /// - Must be called with the same `bytes` used to create this frame.
+    #[inline]
+    pub(crate) unsafe fn pqc_pubkey_bytes<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        if !self.pqc_frame.present {
+            return None;
+        }
+        let start = usize::from(self.pqc_frame.pubkey_offset);
+        Some(&bytes[start..start + 897])
+    }
+
+    /// Return the Falcon signature bytes (actual length, not padded) from a
+    /// PQC transaction. Returns `None` if not a PQC transaction.
+    /// # Safety
+    /// - Must be called with the same `bytes` used to create this frame.
+    #[inline]
+    pub(crate) unsafe fn pqc_signature_bytes<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        if !self.pqc_frame.present {
+            return None;
+        }
+        let len_offset = usize::from(self.pqc_frame.sig_len_offset);
+        let actual_len =
+            u16::from_le_bytes([bytes[len_offset], bytes[len_offset + 1]]) as usize;
+        let start = usize::from(self.pqc_frame.sig_offset);
+        if actual_len == 0 || actual_len > 666 {
+            return None;
+        }
+        Some(&bytes[start..start + actual_len])
     }
 }
 

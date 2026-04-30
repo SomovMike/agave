@@ -58,6 +58,16 @@ impl TransactionConfigFrame {
         self.mask_offset != 0
     }
 
+    /// Returns true if the PQC bit (bit 5) is set in the config mask.
+    #[inline(always)]
+    pub(crate) const fn has_pqc(&self) -> bool {
+        self.mask & (1u32 << 5) != 0
+    }
+
+    /// Bits that carry an associated 4-byte config value (SIMD-0385 bits 0-4).
+    /// Bit 5 (PQC flag) is a pure flag with no config value.
+    const CONFIG_VALUE_BITS: u32 = 0b1_1111;
+
     /// Config Mask has been successfully parsed before advancing to `ConfigValues`
     /// region; Now can try to create TransactionConfigFrame by parsing values.
     #[inline(always)]
@@ -70,7 +80,7 @@ impl TransactionConfigFrame {
         assert!(mask_offset > 0, "txv1 mask offset must be greater than 0");
 
         Self::sanitize_mask(mask)?;
-        let num_values = mask.count_ones() as u8;
+        let num_values = (mask & Self::CONFIG_VALUE_BITS).count_ones() as u8;
         let mask_offset =
             u16::try_from(mask_offset).map_err(|_| TransactionViewError::SanitizeError)?;
         let values_offset =
@@ -94,7 +104,9 @@ impl TransactionConfigFrame {
     /// so they must either both be set or both be clear.
     #[inline(always)]
     fn sanitize_mask(mask: u32) -> Result<()> {
-        const ALLOWED_TRANSACTION_CONFIG_MASK: u32 = 0b1_1111;
+        // Bits 0-4: standard config fields (SIMD-0385)
+        // Bit 5: PQC signature present (algorithm ID in config value)
+        const ALLOWED_TRANSACTION_CONFIG_MASK: u32 = 0b11_1111;
 
         // Reject unknown / reserved bits
         if mask & !ALLOWED_TRANSACTION_CONFIG_MASK != 0 {
@@ -119,6 +131,9 @@ impl TransactionConfigFrame {
     /// Return the packed word index for a given set bit. Eg: counts
     /// bits set below `bit`.
     ///
+    /// Only works for bits that carry config values (bits 0-4).
+    /// Bit 5 (PQC flag) has no config value and always returns `None`.
+    ///
     /// Example:
     ///   mask = 0b0001_1100
     ///   bit 2 -> 0
@@ -126,12 +141,15 @@ impl TransactionConfigFrame {
     ///   bit 4 -> 2
     #[inline(always)]
     pub(crate) fn word_index_for_bit(&self, bit: u8) -> Option<u8> {
-        if !self.is_present() || !Self::has_bit(self.mask, bit) {
+        if !self.is_present()
+            || !Self::has_bit(self.mask, bit)
+            || !Self::has_bit(Self::CONFIG_VALUE_BITS, bit)
+        {
             return None;
         }
 
         let mask_before_bit = (1u32 << bit).wrapping_sub(1);
-        Some((self.mask & mask_before_bit).count_ones() as u8)
+        Some((self.mask & mask_before_bit & Self::CONFIG_VALUE_BITS).count_ones() as u8)
     }
 
     #[inline(always)]
@@ -190,6 +208,18 @@ impl<'a> TransactionConfigView<'a> {
             // - u32 is valid for any bytes
             u32::from_le(unsafe { unchecked_copy_value(self.bytes, offset) })
         })
+    }
+
+    /// PQC algorithm identifier. Returns `Some(0)` (Falcon-512) when the
+    /// PQC flag (bit 5) is set, `None` otherwise. Bit 5 is a pure flag with
+    /// no associated config value — the algorithm is implicit.
+    #[inline(always)]
+    pub fn pqc_algorithm_id(&self) -> Option<u32> {
+        if self.transaction_config_frame.has_pqc() {
+            Some(0)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
@@ -311,9 +341,19 @@ mod tests {
 
     #[test]
     fn test_unknown_bits_rejected() {
-        // Single unknown bit (bit 5)
+        // Bit 5 (PQC) is now valid
         assert_eq!(
             TransactionConfigFrame::sanitize_mask(0b10_0000),
+            Ok(())
+        );
+        // All 6 bits valid
+        assert_eq!(
+            TransactionConfigFrame::sanitize_mask(0b11_1111),
+            Ok(())
+        );
+        // Bit 6 and above are still unknown
+        assert_eq!(
+            TransactionConfigFrame::sanitize_mask(0b100_0000),
             Err(TransactionViewError::SanitizeError)
         );
         // Multiple unknown bits
@@ -328,7 +368,7 @@ mod tests {
         );
         // Unknown bits mixed with valid bits
         assert_eq!(
-            TransactionConfigFrame::sanitize_mask(0b1_1111 | (1 << 16)),
+            TransactionConfigFrame::sanitize_mask(0b11_1111 | (1 << 16)),
             Err(TransactionViewError::SanitizeError)
         );
     }
@@ -452,5 +492,84 @@ mod tests {
             TransactionConfigFrame::try_new(&bytes, mask_offset, mask, &mut offset),
             Err(TransactionViewError::ParseError)
         );
+    }
+
+    #[test]
+    fn test_pqc_bit_only() {
+        // bit 5 = PQC flag (pure flag, no config value)
+        let mask = 0b10_0000u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 3]);
+        let mask_offset = bytes.len();
+        bytes.extend_from_slice(&mask.to_le_bytes());
+        let values_offset = bytes.len();
+        // No config value for bit 5 — it's a pure flag
+
+        let mut offset = values_offset;
+        let frame = TransactionConfigFrame::try_new(&bytes, mask_offset, mask, &mut offset)
+            .inspect(|_| assert_eq!(offset, bytes.len()))
+            .unwrap();
+        assert!(frame.is_present());
+        assert!(frame.has_pqc());
+        assert_eq!(frame.num_values, 0);
+
+        let view = TransactionConfigView {
+            transaction_config_frame: &frame,
+            bytes: &bytes,
+        };
+        assert_eq!(view.pqc_algorithm_id().unwrap(), 0);
+        assert!(view.priority_fee_lamports().is_none());
+        assert!(view.compute_unit_limit().is_none());
+    }
+
+    #[test]
+    fn test_pqc_with_other_fields() {
+        // bits 2 (CU limit) + 5 (PQC flag, no config value)
+        let mask = 0b10_0100u32;
+        let cu = 200_000u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 4]);
+        let mask_offset = bytes.len();
+        bytes.extend_from_slice(&mask.to_le_bytes());
+        let values_offset = bytes.len();
+        bytes.extend_from_slice(&u32le(cu)); // bit 2 -> word 0
+        // No config value for bit 5
+
+        let mut offset = values_offset;
+        let frame = TransactionConfigFrame::try_new(&bytes, mask_offset, mask, &mut offset)
+            .inspect(|_| assert_eq!(offset, bytes.len()))
+            .unwrap();
+        assert!(frame.has_pqc());
+        assert_eq!(frame.num_values, 1);
+
+        let view = TransactionConfigView {
+            transaction_config_frame: &frame,
+            bytes: &bytes,
+        };
+        assert_eq!(view.compute_unit_limit().unwrap(), cu);
+        assert_eq!(view.pqc_algorithm_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_has_pqc_false_when_unset() {
+        let frame = TransactionConfigFrame::not_applicable();
+        assert!(!frame.has_pqc());
+
+        let mask = 0b1_1111u32; // all standard bits, no PQC
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 2]);
+        let mask_offset = bytes.len();
+        bytes.extend_from_slice(&mask.to_le_bytes());
+        let values_offset = bytes.len();
+        // 5 config values (bits 0,1,2,3,4)
+        for _ in 0..5 {
+            bytes.extend_from_slice(&u32le(0));
+        }
+        let mut offset = values_offset;
+        let frame =
+            TransactionConfigFrame::try_new(&bytes, mask_offset, mask, &mut offset).unwrap();
+        assert!(!frame.has_pqc());
     }
 }

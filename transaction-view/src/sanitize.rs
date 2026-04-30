@@ -83,12 +83,18 @@ fn sanitize_config(view: &UnsanitizedTransactionView<impl TransactionData>) -> R
     Ok(())
 }
 
-/// Sigantures Constraint:
-/// * Number of signatures must equal: num_required_signatures
-/// * Max signatures <= 12
+/// Signatures Constraint:
+/// * Number of Ed25519 signatures + PQC signers must equal num_required_signatures
+/// * Max Ed25519 signatures <= 12
 fn sanitize_signatures(view: &UnsanitizedTransactionView<impl TransactionData>) -> Result<()> {
-    // Check the required number of signatures matches the number of signatures.
-    if view.num_signatures() != view.num_required_signatures() {
+    let total_signers = if view.has_pqc() {
+        // PQC signer 0 is not in the Ed25519 signatures array
+        view.num_signatures().wrapping_add(1)
+    } else {
+        view.num_signatures()
+    };
+
+    if total_signers != view.num_required_signatures() {
         return Err(TransactionViewError::SanitizeError);
     }
 
@@ -96,9 +102,8 @@ fn sanitize_signatures(view: &UnsanitizedTransactionView<impl TransactionData>) 
         return Err(TransactionViewError::SanitizeError);
     }
 
-    // Each signature is associated with a unique static public key.
-    // Check that there are at least as many static account keys as signatures.
-    if view.num_static_account_keys() < view.num_signatures() {
+    // Each signer is associated with a unique static public key.
+    if view.num_static_account_keys() < total_signers {
         return Err(TransactionViewError::SanitizeError);
     }
 
