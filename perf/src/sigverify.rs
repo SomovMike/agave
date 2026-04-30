@@ -12,6 +12,7 @@ use {
     },
     log::warn,
     rayon::prelude::*,
+    solana_pqc::{FalconPublicKey, FalconSignature},
 };
 
 // Empirically derived to constrain max verify latency to ~8ms at lower packet counts
@@ -48,7 +49,6 @@ impl std::convert::From<std::num::TryFromIntError> for PacketError {
 /// Caller must do packet.set_discard(true) if this returns false.
 #[must_use]
 fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
-    // If this packet was already marked as discard, drop it
     if packet.meta().discard() {
         return false;
     }
@@ -68,29 +68,38 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
 
         if matches!(view.version(), TransactionVersion::V1) {
             let msg = view.message_data();
-            warn!("[PQC-DEBUG] V1 tx parsed OK: data_len={}, msg_len={}, sigs={}, keys={}",
-                data.len(), msg.len(), view.signatures().len(), view.static_account_keys().len());
+            warn!("[PQC-DEBUG] V1 tx parsed OK: data_len={}, msg_len={}, sigs={}, keys={}, pqc={}",
+                data.len(), msg.len(), view.signatures().len(),
+                view.static_account_keys().len(), view.has_pqc());
         }
 
         let is_simple_vote_tx = is_simple_vote_transaction_view(&view);
         if reject_non_vote && !is_simple_vote_tx {
             (is_simple_vote_tx, false)
         } else {
-            let signatures = view.signatures();
-            if signatures.is_empty() {
-                (is_simple_vote_tx, false)
+            let message = view.message_data();
+            let static_account_keys = view.static_account_keys();
+
+            let verified = if view.has_pqc() {
+                // PQC path: Falcon verification for signer 0
+                verify_pqc_transaction(&view, message, static_account_keys)
             } else {
-                let message = view.message_data();
-                let static_account_keys = view.static_account_keys();
-                let verified = signatures
-                    .iter()
-                    .zip(static_account_keys.iter())
-                    .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message));
-                if matches!(view.version(), TransactionVersion::V1) {
-                    warn!("[PQC-DEBUG] V1 sig verify result: {}", verified);
+                // Standard Ed25519 path
+                let signatures = view.signatures();
+                if signatures.is_empty() {
+                    false
+                } else {
+                    signatures
+                        .iter()
+                        .zip(static_account_keys.iter())
+                        .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message))
                 }
-                (is_simple_vote_tx, verified)
+            };
+
+            if matches!(view.version(), TransactionVersion::V1) {
+                warn!("[PQC-DEBUG] V1 sig verify result: {} (pqc={})", verified, view.has_pqc());
             }
+            (is_simple_vote_tx, verified)
         }
     };
 
@@ -99,6 +108,68 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
     }
 
     verified
+}
+
+/// Verify a PQC (Falcon-512) transaction.
+///
+/// 1. Extract Falcon pubkey and signature from the wire data.
+/// 2. Verify that `SHA-256(falcon_pubkey) == account_keys[0]` (address binding).
+/// 3. Verify the Falcon signature against the message bytes.
+/// 4. Verify any remaining Ed25519 co-signers (signers 1..N).
+fn verify_pqc_transaction<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    message: &[u8],
+    static_account_keys: &[solana_pubkey::Pubkey],
+) -> bool {
+    let Some(pk_bytes) = view.pqc_pubkey_bytes() else {
+        warn!("[PQC-VERIFY] Missing Falcon pubkey in PQC transaction");
+        return false;
+    };
+    let Some(sig_bytes) = view.pqc_signature_bytes() else {
+        warn!("[PQC-VERIFY] Missing Falcon signature in PQC transaction");
+        return false;
+    };
+
+    let Some(falcon_pk) = FalconPublicKey::from_bytes(pk_bytes) else {
+        warn!("[PQC-VERIFY] Invalid Falcon pubkey length: {}", pk_bytes.len());
+        return false;
+    };
+    let Some(falcon_sig) = FalconSignature::from_bytes(sig_bytes) else {
+        warn!("[PQC-VERIFY] Invalid Falcon signature length: {}", sig_bytes.len());
+        return false;
+    };
+
+    // Step 1: Verify address derivation (SHA-256(falcon_pubkey) == account_keys[0])
+    if static_account_keys.is_empty() {
+        return false;
+    }
+    let derived_address = falcon_pk.derive_address();
+    if derived_address != static_account_keys[0] {
+        warn!("[PQC-VERIFY] Address mismatch: derived={}, expected={}",
+            derived_address, static_account_keys[0]);
+        return false;
+    }
+
+    // Step 2: Verify Falcon signature
+    if !falcon_sig.verify(&falcon_pk, message) {
+        warn!("[PQC-VERIFY] Falcon signature verification FAILED");
+        return false;
+    }
+
+    // Step 3: Verify remaining Ed25519 co-signers (if any)
+    let ed25519_signatures = view.signatures();
+    let ed25519_ok = ed25519_signatures
+        .iter()
+        .zip(static_account_keys[1..].iter())
+        .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message));
+
+    if !ed25519_ok {
+        warn!("[PQC-VERIFY] Ed25519 co-signer verification FAILED");
+        return false;
+    }
+
+    warn!("[PQC-VERIFY] Falcon + Ed25519 verification SUCCESS");
+    true
 }
 
 pub fn count_packets_in_batches(batches: &[PacketBatch]) -> usize {

@@ -46,6 +46,7 @@ use {
     solana_message::{AddressLoader, SanitizedMessage},
     solana_metrics::inc_new_counter_info,
     solana_perf::packet::PACKET_DATA_SIZE,
+    solana_pqc::{FalconPublicKey, FalconSignature},
     solana_program_pack::Pack,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_rpc_client_api::{
@@ -3859,8 +3860,60 @@ pub mod rpc_full {
                     "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
                 ))
             })?;
-            let (wire_transaction, unsanitized_tx) =
-                decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
+
+            // Decode the wire bytes first (supports V1 sizes up to 4096).
+            let wire_transaction = decode_wire_bytes(&data, binary_encoding)?;
+
+            // PQC V1 transactions cannot be deserialized through the standard
+            // wincode path because the signature section uses a 1565-byte
+            // Falcon blob instead of 64-byte Ed25519 signatures.  Detect PQC
+            // upfront and take a dedicated fast-path that skips preflight and
+            // forwards wire bytes directly to the TPU.
+            if is_pqc_v1_wire(&wire_transaction) {
+                warn!(
+                    "[PQC-TRACE] RPC send_transaction: PQC V1 detected, wire_len={}",
+                    wire_transaction.len()
+                );
+
+                let (signature, blockhash, message_hash) =
+                    parse_pqc_wire_transaction(&wire_transaction)?;
+
+                let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot,
+                })?;
+
+                let last_valid_block_height = preflight_bank
+                    .get_blockhash_last_valid_block_height(&blockhash)
+                    .unwrap_or_else(|| {
+                        preflight_bank.block_height()
+                            + preflight_bank.max_processing_age() as u64
+                    });
+
+                warn!(
+                    "[PQC-TRACE] RPC send_transaction: PQC proxy_sig={}, forwarding to TPU",
+                    signature
+                );
+
+                return _send_transaction(
+                    meta,
+                    message_hash,
+                    signature,
+                    blockhash,
+                    wire_transaction,
+                    last_valid_block_height,
+                    None,
+                    max_retries,
+                );
+            }
+
+            // Standard (non-PQC) path: deserialize via wincode.
+            let unsanitized_tx: VersionedTransaction =
+                wincode::deserialize(&wire_transaction).map_err(|err| {
+                    Error::invalid_params(format!(
+                        "failed to deserialize VersionedTransaction: {err}"
+                    ))
+                })?;
 
             warn!("[PQC-TRACE] RPC send_transaction: wire_len={}, first_byte=0x{:02x}, skip_preflight={}, version={:?}",
                 wire_transaction.len(),
@@ -3899,10 +3952,6 @@ pub mod rpc_full {
                 .get_durable_nonce()
                 .map(|&pubkey| (pubkey, blockhash));
             if durable_nonce_info.is_some() || (skip_preflight && last_valid_block_height == 0) {
-                // While it uses a defined constant, this last_valid_block_height value is chosen arbitrarily.
-                // It provides a fallback timeout for durable-nonce transaction retries in case of
-                // malicious packing of the retry queue. Durable-nonce transactions are otherwise
-                // retried until the nonce is advanced.
                 last_valid_block_height =
                     preflight_bank.block_height() + preflight_bank.max_processing_age() as u64;
             }
@@ -4377,23 +4426,25 @@ fn rpc_perf_sample_from_perf_sample(slot: u64, sample: PerfSample) -> RpcPerfSam
 
 const MAX_BASE58_SIZE: usize = 1683; // Golden, bump if PACKET_DATA_SIZE changes
 const MAX_BASE64_SIZE: usize = 1644; // Golden, bump if PACKET_DATA_SIZE changes
-fn decode_and_deserialize<T>(
-    encoded: String,
+
+const V1_MAX_TRANSACTION_SIZE: usize = 4096;
+const V1_MAX_BASE58_SIZE: usize = 5654;
+const V1_MAX_BASE64_SIZE: usize = 5464;
+
+fn decode_wire_bytes(
+    encoded: &str,
     encoding: TransactionBinaryEncoding,
-) -> Result<(Vec<u8>, T)>
-where
-    T: for<'a> wincode::SchemaRead<'a, wincode::config::DefaultConfig, Dst = T>,
-{
+) -> Result<Vec<u8>> {
+    let is_v1_possible = encoded.len() > MAX_BASE64_SIZE.max(MAX_BASE58_SIZE);
+
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
             inc_new_counter_info!("rpc-base58_encoded_tx", 1);
-            if encoded.len() > MAX_BASE58_SIZE {
+            let max = if is_v1_possible { V1_MAX_BASE58_SIZE } else { MAX_BASE58_SIZE };
+            if encoded.len() > max {
                 return Err(Error::invalid_params(format!(
-                    "base58 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
-                    type_name::<T>(),
-                    encoded.len(),
-                    MAX_BASE58_SIZE,
-                    PACKET_DATA_SIZE,
+                    "base58 encoded transaction too large: {} bytes (max: {})",
+                    encoded.len(), max
                 )));
             }
             bs58::decode(encoded)
@@ -4402,13 +4453,11 @@ where
         }
         TransactionBinaryEncoding::Base64 => {
             inc_new_counter_info!("rpc-base64_encoded_tx", 1);
-            if encoded.len() > MAX_BASE64_SIZE {
+            let max = if is_v1_possible { V1_MAX_BASE64_SIZE } else { MAX_BASE64_SIZE };
+            if encoded.len() > max {
                 return Err(Error::invalid_params(format!(
-                    "base64 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
-                    type_name::<T>(),
-                    encoded.len(),
-                    MAX_BASE64_SIZE,
-                    PACKET_DATA_SIZE,
+                    "base64 encoded transaction too large: {} bytes (max: {})",
+                    encoded.len(), max
                 )));
             }
             BASE64_STANDARD
@@ -4416,14 +4465,31 @@ where
                 .map_err(|e| Error::invalid_params(format!("invalid base64 encoding: {e:?}")))?
         }
     };
-    if wire_output.len() > PACKET_DATA_SIZE {
+
+    let max_decoded = if wire_output.first().copied().unwrap_or(0) & 0x80 != 0 {
+        V1_MAX_TRANSACTION_SIZE
+    } else {
+        PACKET_DATA_SIZE
+    };
+
+    if wire_output.len() > max_decoded {
         return Err(Error::invalid_params(format!(
-            "decoded {} too large: {} bytes (max: {} bytes)",
-            type_name::<T>(),
-            wire_output.len(),
-            PACKET_DATA_SIZE
+            "decoded transaction too large: {} bytes (max: {} bytes)",
+            wire_output.len(), max_decoded
         )));
     }
+
+    Ok(wire_output)
+}
+
+fn decode_and_deserialize<T>(
+    encoded: String,
+    encoding: TransactionBinaryEncoding,
+) -> Result<(Vec<u8>, T)>
+where
+    T: for<'a> wincode::SchemaRead<'a, wincode::config::DefaultConfig, Dst = T>,
+{
+    let wire_output = decode_wire_bytes(&encoded, encoding)?;
 
     wincode::deserialize(&wire_output[..])
         .map_err(|err| {
@@ -4434,6 +4500,50 @@ where
             ))
         })
         .map(|output| (wire_output, output))
+}
+
+/// Check if raw bytes represent a PQC V1 transaction (first byte = V1_PREFIX,
+/// config mask bit 5 set).
+fn is_pqc_v1_wire(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let first = bytes[0];
+    if first != (solana_message::MESSAGE_VERSION_PREFIX | 1) {
+        return false;
+    }
+    let mask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    mask & (1u32 << solana_pqc::PQC_CONFIG_MASK_BIT) != 0
+}
+
+/// Parse a PQC V1 transaction from wire bytes using TransactionView.
+/// Returns (proxy_signature, blockhash, message_hash) on success.
+fn parse_pqc_wire_transaction(wire: &[u8]) -> Result<(Signature, Hash, Hash)> {
+    use agave_transaction_view::transaction_view::UnsanitizedTransactionView;
+    use sha2::{Digest, Sha256};
+
+    let view = UnsanitizedTransactionView::try_new_unsanitized(wire)
+        .map_err(|e| Error::invalid_params(format!("invalid PQC transaction: {e:?}")))?;
+
+    if !view.has_pqc() {
+        return Err(Error::invalid_params("not a PQC transaction"));
+    }
+
+    let pk_bytes = view.pqc_pubkey_bytes()
+        .ok_or_else(|| Error::invalid_params("missing PQC public key"))?;
+    let sig_bytes = view.pqc_signature_bytes()
+        .ok_or_else(|| Error::invalid_params("missing PQC signature"))?;
+
+    let falcon_pk = FalconPublicKey::from_bytes(pk_bytes)
+        .ok_or_else(|| Error::invalid_params("invalid Falcon public key"))?;
+    let falcon_sig = FalconSignature::from_bytes(sig_bytes)
+        .ok_or_else(|| Error::invalid_params("invalid Falcon signature"))?;
+
+    let proxy_signature = falcon_sig.to_proxy_signature(&falcon_pk);
+    let blockhash = *view.recent_blockhash();
+    let message_hash = Hash::new_from_array(Sha256::digest(view.message_data()).into());
+
+    Ok((proxy_signature, blockhash, message_hash))
 }
 
 fn sanitize_transaction(
