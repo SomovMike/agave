@@ -8,6 +8,9 @@ use {
         },
         transaction_with_meta::TransactionWithMeta,
     },
+    solana_compute_budget::compute_budget_limits::{
+        MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+    },
     solana_message::{AddressLoader, TransactionSignatureDetails, VersionedMessage},
     solana_program_entrypoint::HEAP_LENGTH,
     solana_pubkey::Pubkey,
@@ -60,11 +63,11 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
             VersionedMessage::V1(msg) => {
                 VersionedTransactionConfiguration::V1(TransactionConfiguration {
                     priority_fee_lamports: msg.config.priority_fee.unwrap_or(0),
-                    compute_unit_limit: msg.config.compute_unit_limit.unwrap_or(0),
+                    compute_unit_limit: msg.config.compute_unit_limit.unwrap_or(MAX_COMPUTE_UNIT_LIMIT),
                     loaded_accounts_data_size_limit: msg
                         .config
                         .loaded_accounts_data_size_limit
-                        .unwrap_or(0),
+                        .unwrap_or(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get()),
                     updated_heap_bytes: msg.config.heap_size.unwrap_or(HEAP_LENGTH as u32),
                 })
             }

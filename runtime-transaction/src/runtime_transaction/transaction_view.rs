@@ -12,6 +12,9 @@ use {
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
     },
+    solana_compute_budget::compute_budget_limits::{
+        MAX_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+    },
     solana_message::{
         LegacyMessage, MessageHeader, SanitizedMessage, TransactionSignatureDetails,
         VersionedMessage,
@@ -21,7 +24,7 @@ use {
     },
     solana_program_entrypoint::HEAP_LENGTH,
     solana_pubkey::Pubkey,
-    solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_transaction::{svm_message::SVMMessage, svm_transaction::SVMTransaction},
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
         simple_vote_transaction_checker::is_simple_vote_transaction_impl,
@@ -97,10 +100,10 @@ where
             // SanitizedTransactionView.
             VersionedTransactionConfiguration::V1(TransactionConfiguration {
                 priority_fee_lamports: transaction_config_view.priority_fee_lamports().unwrap_or(0),
-                compute_unit_limit: transaction_config_view.compute_unit_limit().unwrap_or(0),
+                compute_unit_limit: transaction_config_view.compute_unit_limit().unwrap_or(MAX_COMPUTE_UNIT_LIMIT),
                 loaded_accounts_data_size_limit: transaction_config_view
                     .loaded_accounts_data_size_limit()
-                    .unwrap_or(0),
+                    .unwrap_or(MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES.get()),
                 updated_heap_bytes: transaction_config_view
                     .requested_heap_size()
                     .unwrap_or(HEAP_LENGTH as u32),
@@ -169,18 +172,28 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
             }),
         };
 
-        // SAFETY:
-        // - Simple conversion between different formats
-        // - `ResolvedTransactionView` has undergone sanitization checks
-        Cow::Owned(
-            SanitizedTransaction::try_new_from_fields(
-                message,
-                *self.message_hash(),
-                self.is_simple_vote_transaction(),
-                signatures,
-            )
-            .expect("transaction view is sanitized"),
-        )
+        let result = SanitizedTransaction::try_new_from_fields(
+            message,
+            *self.message_hash(),
+            self.is_simple_vote_transaction(),
+            signatures,
+        );
+
+        if let Err(ref e) = result {
+            eprintln!(
+                "[PQC-TRACE] as_sanitized_transaction FAILED: {:?}, \
+                 version={:?}, num_required_sigs={}, num_static_keys={}, \
+                 num_sigs_provided={}, has_pqc={}",
+                e,
+                self.version(),
+                self.num_required_signatures(),
+                self.static_account_keys().len(),
+                <Self as SVMTransaction>::signatures(self).len(),
+                self.transaction.has_pqc(),
+            );
+        }
+
+        Cow::Owned(result.expect("transaction view is sanitized"))
     }
 
     fn to_versioned_transaction(&self) -> VersionedTransaction {

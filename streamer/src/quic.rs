@@ -17,7 +17,6 @@ use {
     },
     rustls::KeyLogFile,
     solana_keypair::Keypair,
-    solana_packet::PACKET_DATA_SIZE,
     solana_perf::packet::PacketBatch,
     solana_tls_utils::{NotifyKeyUpdate, new_dummy_x509_certificate, tls_server_config_builder},
     std::{
@@ -570,14 +569,17 @@ pub struct SimpleQosQuicStreamerConfig {
     pub qos_config: SimpleQosConfig,
 }
 
+/// Maximum wire size for V1/PQC transactions (matches V1_MAX_TRANSACTION_SIZE in RPC).
+const MAX_STREAM_DATA_BYTES: u32 = 4096;
+
 impl Default for QuicStreamerConfig {
     fn default() -> Self {
         Self {
             max_connections_per_ipaddr_per_min: DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
             wait_for_chunk_timeout: DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             num_threads: NonZeroUsize::new(num_cpus::get().min(1)).expect("1 is non-zero"),
-            stream_receive_window_size: PACKET_DATA_SIZE as u32,
-            max_stream_data_bytes: PACKET_DATA_SIZE as u32,
+            stream_receive_window_size: MAX_STREAM_DATA_BYTES,
+            max_stream_data_bytes: MAX_STREAM_DATA_BYTES,
         }
     }
 }

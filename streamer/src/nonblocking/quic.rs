@@ -730,10 +730,11 @@ fn handle_chunks(
     for chunk in chunks {
         accum.meta.size += chunk.len();
         if accum.meta.size > max_stream_data_bytes as usize {
-            // A peer can send multiple chunks that together exceed the
-            // configured maximum data bytes receivable over one stream; reject the stream in that case.
             stats.invalid_stream_size.fetch_add(1, Ordering::Relaxed);
-            debug!("invalid stream size {}", accum.meta.size);
+            warn!(
+                "[PQC-TRACE] QUIC stream rejected: size {} > max {}",
+                accum.meta.size, max_stream_data_bytes
+            );
             return Err(());
         }
         accum.chunks.push(chunk);
