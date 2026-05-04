@@ -231,6 +231,75 @@ pub fn is_pqc_config_mask(mask: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// AuthScheme — centralized signature verification abstraction
+// ---------------------------------------------------------------------------
+
+/// Describes how the fee-payer (signer 0) of a transaction is authenticated.
+///
+/// For Ed25519 transactions, `signatures[0]` is the raw Ed25519 signature and
+/// can be verified directly.  For PQC (Falcon-512) transactions,
+/// `signatures[0]` is a deterministic 64-byte hash (the "proxy signature")
+/// and the real Falcon material lives in a trailing blob.
+pub enum AuthScheme<'a> {
+    Ed25519,
+    Falcon {
+        pubkey: &'a [u8],
+        signature: &'a [u8],
+    },
+}
+
+impl<'a> AuthScheme<'a> {
+    /// Verify signer 0 against the message bytes and `account_keys[0]`.
+    ///
+    /// - **Ed25519**: `hash_signature` is the real Ed25519 signature;
+    ///   verified directly against `account_key` and `message`.
+    /// - **Falcon**: verifies (1) that the Falcon pubkey derives to
+    ///   `account_key`, (2) that the Falcon signature is valid over
+    ///   `message`, and (3) that `hash_signature` matches the
+    ///   deterministic proxy hash of the Falcon material.
+    pub fn verify_signer(
+        &self,
+        hash_signature: &Signature,
+        account_key: &Pubkey,
+        message: &[u8],
+    ) -> bool {
+        match self {
+            AuthScheme::Ed25519 => hash_signature.verify(account_key.as_ref(), message),
+            AuthScheme::Falcon { pubkey, signature } => {
+                let Some(falcon_pk) = FalconPublicKey::from_bytes(pubkey) else {
+                    eprintln!("[PQC] AuthScheme: invalid falcon pubkey len={}", pubkey.len());
+                    return false;
+                };
+                let Some(falcon_sig) = FalconSignature::from_bytes(signature) else {
+                    eprintln!("[PQC] AuthScheme: invalid falcon sig len={}", signature.len());
+                    return false;
+                };
+
+                let derived = falcon_pk.derive_address();
+                if derived != *account_key {
+                    eprintln!("[PQC] AuthScheme: address mismatch derived={} expected={}",
+                        derived, account_key);
+                    return false;
+                }
+
+                if !falcon_sig.verify(&falcon_pk, message) {
+                    eprintln!("[PQC] AuthScheme: Falcon sig verify FAILED, msg_len={}", message.len());
+                    return false;
+                }
+
+                let expected_proxy = falcon_sig.to_proxy_signature(&falcon_pk);
+                if *hash_signature != expected_proxy {
+                    eprintln!("[PQC] AuthScheme: proxy mismatch, wire={} expected={}",
+                        hash_signature, expected_proxy);
+                    return false;
+                }
+                true
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Signing (for tests and client code)
 // ---------------------------------------------------------------------------
 
@@ -363,5 +432,39 @@ mod tests {
     fn test_falcon512_constants() {
         assert_eq!(falcon512::public_key_bytes(), FALCON512_PUBKEY_LEN);
         assert_eq!(falcon512::signature_bytes(), FALCON512_SIG_MAX_LEN);
+    }
+
+    #[test]
+    fn test_auth_scheme_ed25519() {
+        let auth = AuthScheme::Ed25519;
+        let bad_sig = Signature::default();
+        let bad_key = Pubkey::new_from_array([0u8; 32]);
+        assert!(!auth.verify_signer(&bad_sig, &bad_key, b"msg"));
+    }
+
+    #[test]
+    fn test_auth_scheme_falcon() {
+        let (pk, sk) = generate_falcon_keypair();
+        let message = b"auth scheme test";
+        let sig = falcon_sign(message, &sk).unwrap();
+        let proxy = sig.to_proxy_signature(&pk);
+        let addr = pk.derive_address();
+
+        let auth = AuthScheme::Falcon {
+            pubkey: pk.as_bytes(),
+            signature: sig.as_bytes(),
+        };
+        assert!(auth.verify_signer(&proxy, &addr, message));
+
+        // Wrong message fails
+        assert!(!auth.verify_signer(&proxy, &addr, b"wrong"));
+
+        // Wrong proxy fails
+        let bad_proxy = Signature::default();
+        assert!(!auth.verify_signer(&bad_proxy, &addr, message));
+
+        // Wrong address fails
+        let bad_addr = Pubkey::new_from_array([1u8; 32]);
+        assert!(!auth.verify_signer(&proxy, &bad_addr, message));
     }
 }

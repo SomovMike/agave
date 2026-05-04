@@ -18,8 +18,7 @@ use {
         containers, context,
         io::{Reader, Writer},
         len::ShortU16,
-        ReadError, ReadResult, SchemaRead, SchemaReadContext, SchemaWrite, UninitBuilder,
-        WriteResult,
+        ReadError, ReadResult, SchemaRead, SchemaReadContext, SchemaWrite, WriteResult,
     },
 };
 #[cfg(feature = "serde")]
@@ -56,22 +55,37 @@ impl TransactionVersion {
     pub const LEGACY: Self = Self::Legacy(Legacy::Legacy);
 }
 
+/// Falcon-512 PQC signer data carried inside a V1 transaction.
+///
+/// Present only when config mask bit 5 is set. The proxy signature
+/// (SHA-256(falcon_sig) || SHA-256(falcon_pubkey)) occupies the standard
+/// 64-byte slot in `signatures[0]`; the real Falcon material lives here.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct FalconSigner {
+    /// Falcon-512 public key (897 bytes).
+    pub pubkey: Vec<u8>,
+    /// Falcon-512 signature (actual bytes, ≤666).
+    pub signature: Vec<u8>,
+}
+
+const FALCON512_PUBKEY_LEN: usize = 897;
+const FALCON512_SIG_MAX_LEN: usize = 666;
+
 // NOTE: Serialization-related changes must be paired with the direct read at sigverify.
 /// An atomic transaction
 #[cfg_attr(feature = "frozen-abi", derive(solana_frozen_abi_macro::AbiExample))]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "wincode", derive(UninitBuilder))]
 #[derive(Debug, PartialEq, Default, Eq, Clone)]
 pub struct VersionedTransaction {
     /// List of signatures
     #[cfg_attr(feature = "serde", serde(with = "short_vec"))]
-    #[cfg_attr(
-        feature = "wincode",
-        wincode(with = "containers::Vec<Signature, ShortU16>")
-    )]
     pub signatures: Vec<Signature>,
     /// Message to sign.
     pub message: VersionedMessage,
+    /// PQC (Falcon-512) signer for the first signature slot.
+    /// Populated during deserialization when the V1 config mask has bit 5 set.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub falcon_signer: Option<FalconSigner>,
 }
 
 impl From<Transaction> for VersionedTransaction {
@@ -79,6 +93,7 @@ impl From<Transaction> for VersionedTransaction {
         Self {
             signatures: transaction.signatures,
             message: VersionedMessage::Legacy(transaction.message),
+            falcon_signer: None,
         }
     }
 }
@@ -131,6 +146,7 @@ impl VersionedTransaction {
         Ok(Self {
             signatures,
             message,
+            falcon_signer: None,
         })
     }
 
@@ -253,12 +269,16 @@ unsafe impl<C: Config> SchemaWrite<C> for VersionedTransaction {
                     )? + <VersionedMessage as SchemaWrite<C>>::size_of(&src.message)?,
                 )
             }
-            VersionedMessage::V1(_) => Ok(
-                // V1 transasction signatures are written as a fixed length array
-                // without a length prefix.
-                <VersionedMessage as SchemaWrite<C>>::size_of(&src.message)?
-                    + src.signatures.len() * SIGNATURE_SIZE,
-            ),
+            VersionedMessage::V1(_) => {
+                let base = <VersionedMessage as SchemaWrite<C>>::size_of(&src.message)?
+                    + src.signatures.len() * SIGNATURE_SIZE;
+                let pqc_trailer = if src.falcon_signer.is_some() {
+                    2 + FALCON512_PUBKEY_LEN + FALCON512_SIG_MAX_LEN
+                } else {
+                    0
+                };
+                Ok(base + pqc_trailer)
+            }
         }
     }
 
@@ -278,8 +298,19 @@ unsafe impl<C: Config> SchemaWrite<C> for VersionedTransaction {
                 unsafe {
                     writer
                         .write_slice_t(&src.signatures)
-                        .map_err(wincode::WriteError::Io)
+                        .map_err(wincode::WriteError::Io)?;
                 }
+                if let Some(ref falcon) = src.falcon_signer {
+                    let sig_len = falcon.signature.len() as u16;
+                    unsafe {
+                        writer.write_slice_t(&sig_len.to_le_bytes())?;
+                        writer.write_slice_t(&falcon.pubkey)?;
+                        let mut padded = [0u8; FALCON512_SIG_MAX_LEN];
+                        padded[..falcon.signature.len()].copy_from_slice(&falcon.signature);
+                        writer.write_slice_t(&padded)?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -324,6 +355,7 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for VersionedTransaction {
             dst.write(Self {
                 signatures,
                 message,
+                falcon_signer: None,
             });
         } else if discriminator == V1_PREFIX {
             // V1 transaction
@@ -336,19 +368,38 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for VersionedTransaction {
             )?;
 
             // validate that we got a V1 message
-            if !matches!(message, VersionedMessage::V1(_)) {
-                return Err(ReadError::Custom("invalid message version"));
-            }
+            let is_pqc = match &message {
+                VersionedMessage::V1(m) => m.config.pqc,
+                _ => return Err(ReadError::Custom("invalid message version")),
+            };
 
             let num_signatures = message.header().num_required_signatures as usize;
             let signatures = <Vec<Signature> as SchemaReadContext<C, _>>::get_with_context(
                 context::Len(num_signatures),
-                reader,
+                reader.by_ref(),
             )?;
+
+            // Read PQC Falcon-512 trailer when config mask bit 5 is set.
+            let falcon_signer = if is_pqc {
+                let sig_len_bytes: [u8; 2] = reader.take_array()?;
+                let sig_len = u16::from_le_bytes(sig_len_bytes) as usize;
+                if sig_len == 0 || sig_len > FALCON512_SIG_MAX_LEN {
+                    return Err(ReadError::Custom("invalid PQC signature length"));
+                }
+                let pubkey = reader.take_borrowed(FALCON512_PUBKEY_LEN)?.to_vec();
+                let sig_padded = reader.take_borrowed(FALCON512_SIG_MAX_LEN)?;
+                Some(FalconSigner {
+                    pubkey,
+                    signature: sig_padded[..sig_len].to_vec(),
+                })
+            } else {
+                None
+            };
 
             dst.write(Self {
                 signatures,
                 message,
+                falcon_signer,
             });
         } else {
             return Err(ReadError::Custom("invalid transaction discriminator"));
@@ -450,6 +501,7 @@ mod tests {
         let tx = VersionedTransaction {
             message: VersionedMessage::V0(MessageV0::default()),
             signatures: vec![],
+            falcon_signer: None,
         };
         assert!(!tx.uses_durable_nonce());
     }
@@ -655,6 +707,7 @@ mod tests {
                         VersionedTransaction {
                             message: message.clone(),
                             signatures: signatures.clone(),
+                            falcon_signer: None,
                         },
                         BincodeVersionedTransaction {
                             message: message.clone(),
@@ -726,6 +779,7 @@ mod tests {
         let v1_tx = VersionedTransaction {
             message: VersionedMessage::V1(message),
             signatures: vec![Signature::default()],
+            falcon_signer: None,
         };
 
         let serialized = wincode::serialize(&v1_tx).unwrap();

@@ -1,6 +1,8 @@
 use {
-    crate::versioned::VersionedTransaction, solana_message::SanitizedVersionedMessage,
-    solana_sanitize::SanitizeError, solana_signature::Signature,
+    crate::versioned::{FalconSigner, VersionedTransaction},
+    solana_message::SanitizedVersionedMessage,
+    solana_sanitize::SanitizeError,
+    solana_signature::Signature,
 };
 
 /// Wraps a sanitized `VersionedTransaction` to provide a safe API
@@ -10,6 +12,8 @@ pub struct SanitizedVersionedTransaction {
     pub(crate) signatures: Vec<Signature>,
     /// Message to sign.
     pub(crate) message: SanitizedVersionedMessage,
+    /// PQC Falcon-512 signer data (propagated from VersionedTransaction).
+    pub(crate) falcon_signer: Option<FalconSigner>,
 }
 
 impl TryFrom<VersionedTransaction> for SanitizedVersionedTransaction {
@@ -25,6 +29,7 @@ impl SanitizedVersionedTransaction {
         Ok(Self {
             signatures: tx.signatures,
             message: SanitizedVersionedMessage::try_from(tx.message)?,
+            falcon_signer: tx.falcon_signer,
         })
     }
 
@@ -33,8 +38,8 @@ impl SanitizedVersionedTransaction {
     }
 
     /// Consumes the SanitizedVersionedTransaction, returning the fields individually.
-    pub fn destruct(self) -> (Vec<Signature>, SanitizedVersionedMessage) {
-        (self.signatures, self.message)
+    pub fn destruct(self) -> (Vec<Signature>, SanitizedVersionedMessage, Option<FalconSigner>) {
+        (self.signatures, self.message, self.falcon_signer)
     }
 }
 
@@ -54,6 +59,7 @@ mod tests {
             message: VersionedMessage::V0(
                 v0::Message::try_compile(&Pubkey::new_unique(), &[], &[], Hash::default()).unwrap(),
             ),
+            falcon_signer: None,
         };
 
         assert_eq!(
@@ -71,6 +77,7 @@ mod tests {
         let tx = VersionedTransaction {
             signatures: vec![Signature::default()],
             message: VersionedMessage::V0(message),
+            falcon_signer: None,
         };
 
         assert_eq!(

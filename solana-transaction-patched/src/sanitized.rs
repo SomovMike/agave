@@ -1,5 +1,7 @@
 use {
-    crate::versioned::{sanitized::SanitizedVersionedTransaction, VersionedTransaction},
+    crate::versioned::{
+        sanitized::SanitizedVersionedTransaction, FalconSigner, VersionedTransaction,
+    },
     solana_address::Address,
     solana_hash::Hash,
     solana_message::{
@@ -28,6 +30,7 @@ pub struct SanitizedTransaction {
     message_hash: Hash,
     is_simple_vote_tx: bool,
     signatures: Vec<Signature>,
+    falcon_signer: Option<FalconSigner>,
 }
 
 /// Set of accounts that must be locked for safe transaction processing
@@ -64,6 +67,7 @@ impl SanitizedTransaction {
         reserved_account_keys: &HashSet<Address>,
     ) -> TransactionResult<Self> {
         let signatures = tx.signatures;
+        let falcon_signer = tx.falcon_signer;
         let SanitizedVersionedMessage { message } = tx.message;
         let message = match message {
             VersionedMessage::Legacy(message) => {
@@ -88,6 +92,7 @@ impl SanitizedTransaction {
             message_hash,
             is_simple_vote_tx,
             signatures,
+            falcon_signer,
         })
     }
 
@@ -137,6 +142,7 @@ impl SanitizedTransaction {
             )),
             is_simple_vote_tx: false,
             signatures: tx.signatures,
+            falcon_signer: None,
         })
     }
 
@@ -166,6 +172,7 @@ impl SanitizedTransaction {
             message_hash,
             signatures,
             is_simple_vote_tx,
+            falcon_signer: None,
         })
     }
 
@@ -183,6 +190,11 @@ impl SanitizedTransaction {
     /// Return the list of signatures for this transaction
     pub fn signatures(&self) -> &[Signature] {
         &self.signatures
+    }
+
+    /// Return the PQC Falcon signer data, if present.
+    pub fn falcon_signer(&self) -> Option<&FalconSigner> {
+        self.falcon_signer.as_ref()
     }
 
     /// Return the signed message
@@ -208,14 +220,17 @@ impl SanitizedTransaction {
             SanitizedMessage::Legacy(legacy_message) => VersionedTransaction {
                 message: VersionedMessage::Legacy(legacy::Message::clone(&legacy_message.message)),
                 signatures,
+                falcon_signer: None,
             },
             SanitizedMessage::V0(sanitized_msg) => VersionedTransaction {
                 signatures,
                 message: VersionedMessage::V0(v0::Message::clone(&sanitized_msg.message)),
+                falcon_signer: None,
             },
             SanitizedMessage::V1(sanitized_msg) => VersionedTransaction {
-                message: VersionedMessage::V1(v1::Message::clone(&sanitized_msg.message)),
+                message: VersionedMessage::V1(sanitized_msg.message.clone().into_owned()),
                 signatures,
+                falcon_signer: None,
             },
         }
     }
@@ -279,20 +294,52 @@ impl SanitizedTransaction {
     }
 
     #[cfg(feature = "verify")]
-    /// Verify the transaction signatures
+    /// Verify the transaction signatures.
+    ///
+    /// For PQC transactions (falcon_signer present), the first signer is
+    /// verified using Falcon-512 via `AuthScheme::verify_signer`, which checks:
+    /// 1. Falcon pubkey derives to the account address
+    /// 2. Falcon signature is valid over the message bytes
+    /// 3. Proxy signature matches the deterministic hash of the Falcon material
+    ///
+    /// Remaining signers (if any) always use Ed25519.
     pub fn verify(&self) -> TransactionResult<()> {
         let message_bytes = self.message_data();
-        if self
+
+        for (i, (signature, pubkey)) in self
             .signatures
             .iter()
             .zip(self.message.account_keys().iter())
-            .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &message_bytes))
-            .any(|verified| !verified)
+            .enumerate()
         {
-            Err(TransactionError::SignatureFailure)
-        } else {
-            Ok(())
+            let verified = if i == 0 {
+                if let Some(falcon) = &self.falcon_signer {
+                    let pubkey_bytes: [u8; 32] = pubkey
+                        .as_ref()
+                        .try_into()
+                        .expect("address is 32 bytes");
+                    let scheme = solana_pqc::AuthScheme::Falcon {
+                        pubkey: &falcon.pubkey,
+                        signature: &falcon.signature,
+                    };
+                    scheme.verify_signer(
+                        signature,
+                        &solana_pubkey::Pubkey::from(pubkey_bytes),
+                        &message_bytes,
+                    )
+                } else {
+                    signature.verify(pubkey.as_ref(), &message_bytes)
+                }
+            } else {
+                signature.verify(pubkey.as_ref(), &message_bytes)
+            };
+
+            if !verified {
+                return Err(TransactionError::SignatureFailure);
+            }
         }
+
+        Ok(())
     }
 
     /// Validate a transaction message against locked accounts

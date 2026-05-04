@@ -9068,8 +9068,6 @@ dependencies = [
 [[package]]
 name = "solana-message"
 version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf3349552a323d44d8936b81f003ea7a2fea8566684ebf0dc25d34ad4df2b103"
 dependencies = [
  "blake3",
  "lazy_static",
@@ -11180,6 +11178,8 @@ dependencies = [
  "solana-instruction",
  "solana-instruction-error",
  "solana-message",
+ "solana-pqc",
+ "solana-pubkey 4.2.0",
  "solana-sanitize",
  "solana-sdk-ids",
  "solana-short-vec",

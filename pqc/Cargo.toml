@@ -21,7 +21,7 @@ pqcrypto-falcon = { workspace = true }
 pqcrypto-traits = { workspace = true }
 sha2 = { workspace = true }
 solana-pubkey = { workspace = true, default-features = false }
-solana-signature = { workspace = true }
+solana-signature = { workspace = true, features = ["verify"] }
 
 [dev-dependencies]
 rand = { workspace = true }

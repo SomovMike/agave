@@ -1,0 +1,65 @@
+#[cfg(feature = "serde")]
+use serde_derive::{Deserialize, Serialize};
+#[cfg(feature = "frozen-abi")]
+use solana_frozen_abi_macro::AbiExample;
+#[cfg(feature = "wincode")]
+use wincode::{containers, len::ShortU16, SchemaRead, SchemaWrite};
+use {solana_address::Address, solana_sanitize::Sanitize};
+
+/// A compact encoding of an instruction.
+///
+/// A `CompiledInstruction` is a component of a multi-instruction [`Message`],
+/// which is the core of a Solana transaction. It is created during the
+/// construction of `Message`. Most users will not interact with it directly.
+///
+/// [`Message`]: crate::Message
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Deserialize, Serialize),
+    serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "wincode", derive(SchemaWrite, SchemaRead))]
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct CompiledInstruction {
+    /// Index into the transaction keys array indicating the program account that executes this instruction.
+    pub program_id_index: u8,
+    /// Ordered indices into the transaction keys array indicating which accounts to pass to the program.
+    #[cfg_attr(feature = "serde", serde(with = "solana_short_vec"))]
+    #[cfg_attr(feature = "wincode", wincode(with = "containers::Vec<_, ShortU16>"))]
+    pub accounts: Vec<u8>,
+    /// The program input data.
+    #[cfg_attr(feature = "serde", serde(with = "solana_short_vec"))]
+    #[cfg_attr(feature = "wincode", wincode(with = "containers::Vec<_, ShortU16>"))]
+    pub data: Vec<u8>,
+}
+
+impl Sanitize for CompiledInstruction {}
+
+impl CompiledInstruction {
+    #[cfg(feature = "wincode")]
+    pub fn new<T: wincode::Serialize<Src = T>>(
+        program_ids_index: u8,
+        data: &T,
+        accounts: Vec<u8>,
+    ) -> Self {
+        let data = wincode::serialize(data).unwrap();
+        Self {
+            program_id_index: program_ids_index,
+            accounts,
+            data,
+        }
+    }
+
+    pub fn new_from_raw_parts(program_id_index: u8, data: Vec<u8>, accounts: Vec<u8>) -> Self {
+        Self {
+            program_id_index,
+            accounts,
+            data,
+        }
+    }
+
+    pub fn program_id<'a>(&self, tx_accounts: &'a [Address]) -> &'a Address {
+        &tx_accounts[self.program_id_index as usize]
+    }
+}

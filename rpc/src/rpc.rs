@@ -46,7 +46,7 @@ use {
     solana_message::{AddressLoader, SanitizedMessage},
     solana_metrics::inc_new_counter_info,
     solana_perf::packet::PACKET_DATA_SIZE,
-    solana_pqc::{FalconPublicKey, FalconSignature},
+    solana_pqc,
     solana_program_pack::Pack,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_rpc_client_api::{
@@ -2723,8 +2723,6 @@ fn _send_transaction(
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
-    let wire_len = wire_transaction.len();
-    let first_byte = wire_transaction.first().copied().unwrap_or(0);
     let transaction_info = TransactionInfo::new(
         message_hash,
         signature,
@@ -2735,8 +2733,6 @@ fn _send_transaction(
         max_retries,
         None,
     );
-    warn!("[PQC-TRACE] _send_transaction: enqueuing to SendTransactionService, wire_len={}, first_byte=0x{:02x}, sig={}",
-        wire_len, first_byte, signature);
     meta.transaction_sender
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
@@ -3864,50 +3860,8 @@ pub mod rpc_full {
             // Decode the wire bytes first (supports V1 sizes up to 4096).
             let wire_transaction = decode_wire_bytes(&data, binary_encoding)?;
 
-            // PQC V1 transactions cannot be deserialized through the standard
-            // wincode path because the signature section uses a 1565-byte
-            // Falcon blob instead of 64-byte Ed25519 signatures.  Detect PQC
-            // upfront and take a dedicated fast-path that skips preflight and
-            // forwards wire bytes directly to the TPU.
-            if is_pqc_v1_wire(&wire_transaction) {
-                warn!(
-                    "[PQC-TRACE] RPC send_transaction: PQC V1 detected, wire_len={}",
-                    wire_transaction.len()
-                );
-
-                let (signature, blockhash, message_hash) =
-                    parse_pqc_wire_transaction(&wire_transaction)?;
-
-                let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
-                    commitment: Some(CommitmentConfig::processed()),
-                    min_context_slot,
-                })?;
-
-                let last_valid_block_height = preflight_bank
-                    .get_blockhash_last_valid_block_height(&blockhash)
-                    .unwrap_or_else(|| {
-                        preflight_bank.block_height()
-                            + preflight_bank.max_processing_age() as u64
-                    });
-
-                warn!(
-                    "[PQC-TRACE] RPC send_transaction: PQC proxy_sig={}, forwarding to TPU",
-                    signature
-                );
-
-                return _send_transaction(
-                    meta,
-                    message_hash,
-                    signature,
-                    blockhash,
-                    wire_transaction,
-                    last_valid_block_height,
-                    None,
-                    max_retries,
-                );
-            }
-
-            // Standard (non-PQC) path: deserialize via wincode.
+            // Unified path: wincode now handles PQC V1 transactions natively
+            // (reads the Falcon trailer into VersionedTransaction.falcon_signer).
             let unsanitized_tx: VersionedTransaction =
                 wincode::deserialize(&wire_transaction).map_err(|err| {
                     Error::invalid_params(format!(
@@ -3915,11 +3869,8 @@ pub mod rpc_full {
                     ))
                 })?;
 
-            warn!("[PQC-TRACE] RPC send_transaction: wire_len={}, first_byte=0x{:02x}, skip_preflight={}, version={:?}",
-                wire_transaction.len(),
-                wire_transaction.first().copied().unwrap_or(0),
-                skip_preflight,
-                unsanitized_tx.version());
+            // PQC transactions now go through the same preflight path:
+            // verify() handles Falcon-512 via AuthScheme when falcon_signer is present.
 
             let preflight_commitment = if skip_preflight {
                 Some(CommitmentConfig::processed())
@@ -4031,8 +3982,6 @@ pub mod rpc_full {
                 }
             }
 
-            warn!("[PQC-TRACE] RPC send_transaction: preflight passed, calling _send_transaction sig={}",
-                signature);
             _send_transaction(
                 meta,
                 message_hash,
@@ -4500,50 +4449,6 @@ where
             ))
         })
         .map(|output| (wire_output, output))
-}
-
-/// Check if raw bytes represent a PQC V1 transaction (first byte = V1_PREFIX,
-/// config mask bit 5 set).
-fn is_pqc_v1_wire(bytes: &[u8]) -> bool {
-    if bytes.len() < 8 {
-        return false;
-    }
-    let first = bytes[0];
-    if first != (solana_message::MESSAGE_VERSION_PREFIX | 1) {
-        return false;
-    }
-    let mask = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    mask & (1u32 << solana_pqc::PQC_CONFIG_MASK_BIT) != 0
-}
-
-/// Parse a PQC V1 transaction from wire bytes using TransactionView.
-/// Returns (proxy_signature, blockhash, message_hash) on success.
-fn parse_pqc_wire_transaction(wire: &[u8]) -> Result<(Signature, Hash, Hash)> {
-    use agave_transaction_view::transaction_view::UnsanitizedTransactionView;
-    use sha2::{Digest, Sha256};
-
-    let view = UnsanitizedTransactionView::try_new_unsanitized(wire)
-        .map_err(|e| Error::invalid_params(format!("invalid PQC transaction: {e:?}")))?;
-
-    if !view.has_pqc() {
-        return Err(Error::invalid_params("not a PQC transaction"));
-    }
-
-    let pk_bytes = view.pqc_pubkey_bytes()
-        .ok_or_else(|| Error::invalid_params("missing PQC public key"))?;
-    let sig_bytes = view.pqc_signature_bytes()
-        .ok_or_else(|| Error::invalid_params("missing PQC signature"))?;
-
-    let falcon_pk = FalconPublicKey::from_bytes(pk_bytes)
-        .ok_or_else(|| Error::invalid_params("invalid Falcon public key"))?;
-    let falcon_sig = FalconSignature::from_bytes(sig_bytes)
-        .ok_or_else(|| Error::invalid_params("invalid Falcon signature"))?;
-
-    let proxy_signature = falcon_sig.to_proxy_signature(&falcon_pk);
-    let blockhash = *view.recent_blockhash();
-    let message_hash = Hash::new_from_array(Sha256::digest(view.message_data()).into());
-
-    Ok((proxy_signature, blockhash, message_hash))
 }
 
 fn sanitize_transaction(
