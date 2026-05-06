@@ -309,16 +309,10 @@ pub fn hash_signatures(signatures: &[impl AsRef<[u8]>]) -> Hash {
 }
 
 pub fn hash_transactions(transactions: &[VersionedTransaction]) -> Hash {
-    let mut hash_inputs: Vec<&[u8]> = Vec::new();
-    for tx in transactions {
-        for sig in &tx.signatures {
-            hash_inputs.push(sig.as_ref());
-        }
-        if let Some(ref falcon) = tx.falcon_signer {
-            hash_inputs.push(&falcon.pubkey);
-            hash_inputs.push(&falcon.signature);
-        }
-    }
+    let hash_inputs: Vec<&[u8]> = transactions
+        .iter()
+        .flat_map(|tx| tx.signatures.iter().map(|sig| sig.as_ref()))
+        .collect();
     let merkle_tree = MerkleTree::new(&hash_inputs);
     if let Some(root_hash) = merkle_tree.get_root() {
         *root_hash
