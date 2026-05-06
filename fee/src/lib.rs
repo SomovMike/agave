@@ -50,7 +50,7 @@ pub fn calculate_fee_details(
 /// Fee multiplier for PQC (Falcon-512) signatures.
 /// PQC transactions are ~8x larger on the wire and require lattice-based
 /// verification, justifying a higher fee.
-const PQC_FEE_MULTIPLIER: u64 = 10;
+const PQC_FEE_MULTIPLIER: u64 = 9;
 
 /// Calculate fees from signatures.
 pub fn calculate_signature_fee(
@@ -148,7 +148,7 @@ mod tests {
             10 * LAMPORTS_PER_SIGNATURE
         );
 
-        // PQC signature (10x multiplier).
+        // PQC signature (9x multiplier).
         assert_eq!(
             calculate_signature_fee(
                 SignatureCounts {
@@ -160,7 +160,7 @@ mod tests {
                 },
                 LAMPORTS_PER_SIGNATURE,
             ),
-            LAMPORTS_PER_SIGNATURE + 10 * LAMPORTS_PER_SIGNATURE
+            LAMPORTS_PER_SIGNATURE + 9 * LAMPORTS_PER_SIGNATURE
         );
     }
 }
