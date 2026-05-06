@@ -84,26 +84,22 @@ fn sanitize_config(view: &UnsanitizedTransactionView<impl TransactionData>) -> R
 }
 
 /// Signatures Constraint:
-/// * Number of Ed25519 signatures + PQC signers must equal num_required_signatures
-/// * Max Ed25519 signatures <= 12
+/// * Number of signatures must equal num_required_signatures
+/// * Max signatures <= 12
+/// For PQC transactions, signatures[0] is a 64-byte proxy hash occupying
+/// a standard signature slot, so no special counting is needed.
 fn sanitize_signatures(view: &UnsanitizedTransactionView<impl TransactionData>) -> Result<()> {
-    let total_signers = if view.has_pqc() {
-        // PQC signer 0 is not in the Ed25519 signatures array
-        view.num_signatures().wrapping_add(1)
-    } else {
-        view.num_signatures()
-    };
+    let num_signatures = view.num_signatures();
 
-    if total_signers != view.num_required_signatures() {
+    if num_signatures != view.num_required_signatures() {
         return Err(TransactionViewError::SanitizeError);
     }
 
-    if view.num_signatures() > MAX_SIGNATURES_PER_PACKET {
+    if num_signatures > MAX_SIGNATURES_PER_PACKET {
         return Err(TransactionViewError::SanitizeError);
     }
 
-    // Each signer is associated with a unique static public key.
-    if view.num_static_account_keys() < total_signers {
+    if view.num_static_account_keys() < num_signatures {
         return Err(TransactionViewError::SanitizeError);
     }
 

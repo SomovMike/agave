@@ -28,7 +28,7 @@ use {
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
         simple_vote_transaction_checker::is_simple_vote_transaction_impl,
-        versioned::VersionedTransaction,
+        versioned::{FalconSigner, VersionedTransaction},
     },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::{borrow::Cow, collections::HashSet},
@@ -150,6 +150,7 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
         let VersionedTransaction {
             signatures,
             message,
+            falcon_signer,
         } = self.to_versioned_transaction();
 
         let is_writable_account_cache = (0..self.transaction.total_num_accounts())
@@ -172,24 +173,24 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
             }),
         };
 
-        let result = SanitizedTransaction::try_new_from_fields(
+        let result = SanitizedTransaction::try_new_from_fields_with_falcon(
             message,
             *self.message_hash(),
             self.is_simple_vote_transaction(),
             signatures,
+            falcon_signer,
         );
 
         if let Err(ref e) = result {
             eprintln!(
-                "[PQC-TRACE] as_sanitized_transaction FAILED: {:?}, \
+                "as_sanitized_transaction FAILED: {:?}, \
                  version={:?}, num_required_sigs={}, num_static_keys={}, \
-                 num_sigs_provided={}, has_pqc={}",
+                 num_sigs_provided={}",
                 e,
                 self.version(),
                 self.num_required_signatures(),
                 self.static_account_keys().len(),
                 <Self as SVMTransaction>::signatures(self).len(),
-                self.transaction.has_pqc(),
             );
         }
 
@@ -243,6 +244,7 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
                     compute_unit_limit: config_view.compute_unit_limit(),
                     loaded_accounts_data_size_limit: config_view.loaded_accounts_data_size_limit(),
                     heap_size: config_view.requested_heap_size(),
+                    pqc: config_view.pqc_algorithm_id().is_some(),
                 };
                 VersionedMessage::V1(solana_message::v1::Message {
                     header,
@@ -254,9 +256,25 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
             }
         };
 
+        let falcon_signer = if self.transaction.has_pqc() {
+            match (
+                self.transaction.pqc_pubkey_bytes(),
+                self.transaction.pqc_signature_bytes(),
+            ) {
+                (Some(pk), Some(sig)) => Some(FalconSigner {
+                    pubkey: pk.to_vec(),
+                    signature: sig.to_vec(),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         VersionedTransaction {
             signatures: self.signatures().to_vec(),
             message,
+            falcon_signer,
         }
     }
 

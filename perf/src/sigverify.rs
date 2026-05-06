@@ -12,7 +12,7 @@ use {
     },
     log::warn,
     rayon::prelude::*,
-    solana_pqc::{FalconPublicKey, FalconSignature},
+    solana_pqc::AuthScheme,
 };
 
 // Empirically derived to constrain max verify latency to ~8ms at lower packet counts
@@ -57,20 +57,24 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
         return false;
     };
 
+    let is_v1 = data.first() == Some(&0x81);
+    if is_v1 {
+        warn!("[PQC] verify_packet: V1 packet arrived, len={}", data.len());
+    }
+
     let (is_simple_vote_tx, verified) = {
         let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, true) else {
-            if data.first() == Some(&0x81) {
-                warn!("[PQC-DEBUG] V1 tx sanitization FAILED, data len={}, first bytes={:02x?}",
-                    data.len(), &data[..data.len().min(8)]);
+            if is_v1 {
+                warn!("[PQC] verify_packet: V1 sanitization FAILED, len={}, first_bytes={:02x?}",
+                    data.len(), &data[..data.len().min(16)]);
             }
             return false;
         };
 
-        if matches!(view.version(), TransactionVersion::V1) {
-            let msg = view.message_data();
-            warn!("[PQC-DEBUG] V1 tx parsed OK: data_len={}, msg_len={}, sigs={}, keys={}, pqc={}",
-                data.len(), msg.len(), view.signatures().len(),
-                view.static_account_keys().len(), view.has_pqc());
+        if is_v1 {
+            warn!("[PQC] verify_packet: V1 parsed OK, pqc={}, sigs={}, keys={}, msg_len={}",
+                view.has_pqc(), view.signatures().len(),
+                view.static_account_keys().len(), view.message_data().len());
         }
 
         let is_simple_vote_tx = is_simple_vote_transaction_view(&view);
@@ -78,28 +82,56 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
             (is_simple_vote_tx, false)
         } else {
             let message = view.message_data();
+            let signatures = view.signatures();
             let static_account_keys = view.static_account_keys();
 
-            let verified = if view.has_pqc() {
-                // PQC path: Falcon verification for signer 0
-                verify_pqc_transaction(&view, message, static_account_keys)
-            } else {
-                // Standard Ed25519 path
-                let signatures = view.signatures();
-                if signatures.is_empty() {
-                    false
-                } else {
-                    signatures
-                        .iter()
-                        .zip(static_account_keys.iter())
-                        .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message))
+            if signatures.is_empty() || static_account_keys.is_empty() {
+                if is_v1 {
+                    warn!("[PQC] verify_packet: empty sigs or keys");
                 }
+                return false;
+            }
+
+            let auth = if view.has_pqc() {
+                match (view.pqc_pubkey_bytes(), view.pqc_signature_bytes()) {
+                    (Some(pk), Some(sig)) => {
+                        warn!("[PQC] verify_packet: Falcon trailer found, pk_len={}, sig_len={}",
+                            pk.len(), sig.len());
+                        AuthScheme::Falcon {
+                            pubkey: pk,
+                            signature: sig,
+                        }
+                    }
+                    _ => {
+                        warn!("[PQC] verify_packet: PQC flag set but trailer missing!");
+                        return false;
+                    }
+                }
+            } else {
+                AuthScheme::Ed25519
             };
 
-            if matches!(view.version(), TransactionVersion::V1) {
-                warn!("[PQC-DEBUG] V1 sig verify result: {} (pqc={})", verified, view.has_pqc());
+            let signer0_ok =
+                auth.verify_signer(&signatures[0], &static_account_keys[0], message);
+
+            if is_v1 {
+                warn!("[PQC] verify_packet: signer0_ok={}", signer0_ok);
             }
-            (is_simple_vote_tx, verified)
+
+            let cosigners_ok = signatures[1..]
+                .iter()
+                .zip(static_account_keys[1..].iter())
+                .all(|(sig, pk)| sig.verify(pk.as_ref(), message));
+
+            if is_v1 && !cosigners_ok {
+                warn!("[PQC] verify_packet: cosigners FAILED");
+            }
+
+            let result = signer0_ok && cosigners_ok;
+            if is_v1 {
+                warn!("[PQC] verify_packet: RESULT={}", result);
+            }
+            (is_simple_vote_tx, result)
         }
     };
 
@@ -108,68 +140,6 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool) -> bool {
     }
 
     verified
-}
-
-/// Verify a PQC (Falcon-512) transaction.
-///
-/// 1. Extract Falcon pubkey and signature from the wire data.
-/// 2. Verify that `SHA-256(falcon_pubkey) == account_keys[0]` (address binding).
-/// 3. Verify the Falcon signature against the message bytes.
-/// 4. Verify any remaining Ed25519 co-signers (signers 1..N).
-fn verify_pqc_transaction<D: TransactionData>(
-    view: &SanitizedTransactionView<D>,
-    message: &[u8],
-    static_account_keys: &[solana_pubkey::Pubkey],
-) -> bool {
-    let Some(pk_bytes) = view.pqc_pubkey_bytes() else {
-        warn!("[PQC-VERIFY] Missing Falcon pubkey in PQC transaction");
-        return false;
-    };
-    let Some(sig_bytes) = view.pqc_signature_bytes() else {
-        warn!("[PQC-VERIFY] Missing Falcon signature in PQC transaction");
-        return false;
-    };
-
-    let Some(falcon_pk) = FalconPublicKey::from_bytes(pk_bytes) else {
-        warn!("[PQC-VERIFY] Invalid Falcon pubkey length: {}", pk_bytes.len());
-        return false;
-    };
-    let Some(falcon_sig) = FalconSignature::from_bytes(sig_bytes) else {
-        warn!("[PQC-VERIFY] Invalid Falcon signature length: {}", sig_bytes.len());
-        return false;
-    };
-
-    // Step 1: Verify address derivation (SHA-256(falcon_pubkey) == account_keys[0])
-    if static_account_keys.is_empty() {
-        return false;
-    }
-    let derived_address = falcon_pk.derive_address();
-    if derived_address != static_account_keys[0] {
-        warn!("[PQC-VERIFY] Address mismatch: derived={}, expected={}",
-            derived_address, static_account_keys[0]);
-        return false;
-    }
-
-    // Step 2: Verify Falcon signature
-    if !falcon_sig.verify(&falcon_pk, message) {
-        warn!("[PQC-VERIFY] Falcon signature verification FAILED");
-        return false;
-    }
-
-    // Step 3: Verify remaining Ed25519 co-signers (if any)
-    let ed25519_signatures = view.signatures();
-    let ed25519_ok = ed25519_signatures
-        .iter()
-        .zip(static_account_keys[1..].iter())
-        .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message));
-
-    if !ed25519_ok {
-        warn!("[PQC-VERIFY] Ed25519 co-signer verification FAILED");
-        return false;
-    }
-
-    warn!("[PQC-VERIFY] Falcon + Ed25519 verification SUCCESS");
-    true
 }
 
 pub fn count_packets_in_batches(batches: &[PacketBatch]) -> usize {
@@ -222,13 +192,13 @@ fn is_simple_vote_transaction_view<D: TransactionData>(view: &SanitizedTransacti
     *program_id == solana_sdk_ids::vote::id()
 }
 
-pub fn ed25519_verify(
+pub fn verify_transactions(
     thread_pool: &rayon::ThreadPool,
     batches: &mut [PacketBatch],
     reject_non_vote: bool,
     packet_count: usize,
 ) {
-    debug!("CPU ECDSA for {packet_count}");
+    debug!("CPU sigverify for {packet_count}");
     thread_pool.install(|| {
         batches.par_iter_mut().flatten().for_each(|mut packet| {
             if !packet.meta().discard() && !verify_packet(&mut packet, reject_non_vote) {
@@ -238,9 +208,24 @@ pub fn ed25519_verify(
     });
 }
 
+#[deprecated(note = "use verify_transactions instead")]
+pub fn ed25519_verify(
+    thread_pool: &rayon::ThreadPool,
+    batches: &mut [PacketBatch],
+    reject_non_vote: bool,
+    packet_count: usize,
+) {
+    verify_transactions(thread_pool, batches, reject_non_vote, packet_count)
+}
+
+#[deprecated(note = "use verify_transactions_disabled instead")]
 pub fn ed25519_verify_disabled(thread_pool: &rayon::ThreadPool, batches: &mut [PacketBatch]) {
+    verify_transactions_disabled(thread_pool, batches)
+}
+
+pub fn verify_transactions_disabled(thread_pool: &rayon::ThreadPool, batches: &mut [PacketBatch]) {
     let packet_count = count_packets_in_batches(batches);
-    debug!("disabled ECDSA for {packet_count}");
+    debug!("disabled sigverify for {packet_count}");
 
     thread_pool.install(|| {
         batches.par_iter_mut().flatten().for_each(|mut packet| {
@@ -388,7 +373,7 @@ mod tests {
 
         packet.meta_mut().set_discard(false);
         let mut batches = generate_packet_batches(&packet, 1, 1);
-        ed25519_verify(&mut batches);
+        run_verify(&mut batches);
         assert!(batches[0].get(0).unwrap().meta().discard());
     }
 
@@ -419,7 +404,7 @@ mod tests {
 
         packet.meta_mut().set_discard(false);
         let mut batches = generate_packet_batches(&packet, 1, 1);
-        ed25519_verify(&mut batches);
+        run_verify(&mut batches);
         assert!(batches[0].get(0).unwrap().meta().discard());
     }
 
@@ -549,7 +534,7 @@ mod tests {
         let mut batches = generate_packet_batches(&packet, n, 2);
 
         // verify packets
-        ed25519_verify(&mut batches);
+        run_verify(&mut batches);
 
         // check result
         let should_discard = modify_data;
@@ -561,10 +546,10 @@ mod tests {
         );
     }
 
-    fn ed25519_verify(batches: &mut [PacketBatch]) {
+    fn run_verify(batches: &mut [PacketBatch]) {
         let threadpool = threadpool_for_tests();
         let packet_count = sigverify::count_packets_in_batches(batches);
-        sigverify::ed25519_verify(&threadpool, batches, false, packet_count);
+        sigverify::verify_transactions(&threadpool, batches, false, packet_count);
     }
 
     #[test]
@@ -577,7 +562,7 @@ mod tests {
         let mut batches = generate_packet_batches(&packet, 1, 1);
 
         // verify packets
-        ed25519_verify(&mut batches);
+        run_verify(&mut batches);
         assert!(
             batches
                 .iter()
@@ -640,7 +625,7 @@ mod tests {
 
         // verify packets
         let mut batches: Vec<PacketBatch> = batches.into_iter().map(PacketBatch::from).collect();
-        ed25519_verify(&mut batches);
+        run_verify(&mut batches);
 
         // check result
         let ref_ans = 1u8;

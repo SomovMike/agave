@@ -8,7 +8,6 @@ use {
     crate::sigverify,
     core::time::Duration,
     crossbeam_channel::{Receiver, RecvTimeoutError},
-    log::warn,
     rayon::ThreadPool,
     solana_measure::measure::Measure,
     solana_perf::{
@@ -196,7 +195,7 @@ impl SigVerifier for DisabledSigVerifier {
         total_verify_time_us: Arc<AtomicUsize>,
     ) -> Result<()> {
         let mut verify_time = Measure::start("sigverify_batch_time");
-        sigverify::ed25519_verify_disabled(&self.thread_pool, &mut batches);
+        sigverify::verify_transactions_disabled(&self.thread_pool, &mut batches);
         verify_time.stop();
         total_valid_packets.fetch_add(count_valid_packets(&batches), Ordering::Relaxed);
         total_verify_time_us.fetch_add(verify_time.as_us() as usize, Ordering::Relaxed);
@@ -231,14 +230,6 @@ impl SigVerifyStage {
         let (mut batches, num_packets, recv_duration) =
             streamer::recv_packet_batches(recvr, SOFT_RECEIVE_CAP)?;
 
-        let has_v1 = batches.iter().flat_map(|b| b.iter()).any(|p| {
-            p.data(..).and_then(|d| d.first().copied()) == Some(0x81)
-        });
-        if has_v1 {
-            warn!("[PQC-TRACE] SigVerifyStage::verifier: received batch with V1 tx! batches={}, packets={}",
-                batches.len(), num_packets);
-        }
-
         // If we're already at capacity immediately drop the packets
         let mut should_drop = false;
         if in_flight_count.load(Ordering::Relaxed) >= verifier.capacity() {
@@ -269,11 +260,6 @@ impl SigVerifyStage {
             dedup_time.stop();
             let num_unique = num_packets.saturating_sub(discard_or_dedup_fail);
             let num_packets_to_verify = num_unique;
-
-            if has_v1 {
-                warn!("[PQC-TRACE] SigVerifyStage: after dedup: unique={}, discarded={}, should_drop={}",
-                    num_unique, discard_or_dedup_fail, should_drop);
-            }
 
             verifier.verify_and_send_packets(
                 batches,

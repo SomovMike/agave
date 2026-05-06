@@ -3,7 +3,7 @@
 //! cores.
 
 pub use solana_perf::sigverify::{
-    TxOffset, count_packets_in_batches, ed25519_verify, ed25519_verify_disabled,
+    TxOffset, count_packets_in_batches, verify_transactions, verify_transactions_disabled,
 };
 use {
     crate::{
@@ -73,24 +73,11 @@ impl SigVerifier for TransactionSigVerifier {
         in_flight_count.fetch_add(valid_packets, Ordering::Release);
 
         self.thread_pool.spawn(move || {
-            let has_v1_before = batches.iter().flat_map(|b| b.iter()).any(|p| {
-                p.data(..).and_then(|d| d.first().copied()) == Some(0x81)
-            });
-            if has_v1_before {
-                warn!("[PQC-TRACE] TransactionSigVerifier: BEFORE ed25519_verify, has V1 tx, packets={}",
-                    valid_packets);
-            }
-
             let mut verify_time = Measure::start("sigverify_batch_time");
             let mut batches = batches;
-            sigverify::ed25519_verify(&thread_pool, &mut batches, reject_non_vote, valid_packets);
+            sigverify::verify_transactions(&thread_pool, &mut batches, reject_non_vote, valid_packets);
             verify_time.stop();
             let num_valid_packets = sigverify::count_valid_packets(&batches);
-
-            if has_v1_before {
-                warn!("[PQC-TRACE] TransactionSigVerifier: AFTER ed25519_verify, valid_packets={}, reject_non_vote={}",
-                    num_valid_packets, reject_non_vote);
-            }
 
             let banking_packet_batch = BankingPacketBatch::new(batches);
             if let Some(forward_stage_sender) = &forward_stage_sender {

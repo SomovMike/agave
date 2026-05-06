@@ -161,6 +161,23 @@ impl SanitizedTransaction {
         is_simple_vote_tx: bool,
         signatures: Vec<Signature>,
     ) -> TransactionResult<Self> {
+        Self::try_new_from_fields_with_falcon(
+            message,
+            message_hash,
+            is_simple_vote_tx,
+            signatures,
+            None,
+        )
+    }
+
+    /// Create a sanitized transaction from fields, with optional PQC signer data.
+    pub fn try_new_from_fields_with_falcon(
+        message: SanitizedMessage,
+        message_hash: Hash,
+        is_simple_vote_tx: bool,
+        signatures: Vec<Signature>,
+        falcon_signer: Option<FalconSigner>,
+    ) -> TransactionResult<Self> {
         VersionedTransaction::sanitize_signatures_inner(
             usize::from(message.header().num_required_signatures),
             message.static_account_keys().len(),
@@ -172,7 +189,7 @@ impl SanitizedTransaction {
             message_hash,
             signatures,
             is_simple_vote_tx,
-            falcon_signer: None,
+            falcon_signer,
         })
     }
 
@@ -216,6 +233,7 @@ impl SanitizedTransaction {
     /// recording in the ledger.
     pub fn to_versioned_transaction(&self) -> VersionedTransaction {
         let signatures = self.signatures.clone();
+        let falcon_signer = self.falcon_signer.clone();
         match &self.message {
             SanitizedMessage::Legacy(legacy_message) => VersionedTransaction {
                 message: VersionedMessage::Legacy(legacy::Message::clone(&legacy_message.message)),
@@ -230,7 +248,7 @@ impl SanitizedTransaction {
             SanitizedMessage::V1(sanitized_msg) => VersionedTransaction {
                 message: VersionedMessage::V1(sanitized_msg.message.clone().into_owned()),
                 signatures,
-                falcon_signer: None,
+                falcon_signer,
             },
         }
     }

@@ -59,7 +59,7 @@ impl SigVerifier for BenchSigVerifier {
         total_verify_time_us: Arc<AtomicUsize>,
     ) -> Result<(), SigVerifyServiceError> {
         let mut verify_time = Measure::start("sigverify_batch_time");
-        sigverify::ed25519_verify(&self.thread_pool, &mut batches, false, valid_packets);
+        sigverify::verify_transactions(&self.thread_pool, &mut batches, false, valid_packets);
         verify_time.stop();
         let num_valid_packets = sigverify::count_valid_packets(&batches);
         total_valid_packets.fetch_add(num_valid_packets, Ordering::Relaxed);
@@ -197,7 +197,7 @@ fn bench_shrink_sigverify_stage_core(bencher: &mut Bencher, discard_factor: i32)
         let mut batches = batches0.clone();
 
         let mut verify_time = Measure::start("sigverify_batch_time");
-        sigverify::ed25519_verify(&threadpool, &mut batches, false, num_valid_packets);
+        sigverify::verify_transactions(&threadpool, &mut batches, false, num_valid_packets);
         verify_time.stop();
         black_box(sigverify::count_valid_packets(&batches));
 

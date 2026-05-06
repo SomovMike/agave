@@ -731,10 +731,6 @@ fn handle_chunks(
         accum.meta.size += chunk.len();
         if accum.meta.size > max_stream_data_bytes as usize {
             stats.invalid_stream_size.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                "[PQC-TRACE] QUIC stream rejected: size {} > max {}",
-                accum.meta.size, max_stream_data_bytes
-            );
             return Err(());
         }
         accum.chunks.push(chunk);

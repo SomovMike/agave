@@ -165,47 +165,32 @@ impl TransactionFrame {
         // instruction headers and payloads
         let instructions = InstructionsFrame::try_new_for_v1(bytes, &mut offset, num_instructions)?;
 
-        // signatures — PQC transactions replace the first signer slot
+        // Signatures: all slots are 64-byte Ed25519-sized values.
+        // For PQC transactions, signatures[0] is a deterministic hash
+        // ("proxy signature"); the real Falcon material is in a trailer.
+        let signatures_offset = offset as u16;
+        advance_offset_for_array::<Signature>(
+            bytes,
+            &mut offset,
+            u16::from(num_required_signatures),
+        )?;
+
+        // PQC trailer: if config mask bit 5 is set, the Falcon blob
+        // follows after all 64-byte signature slots.
         let has_pqc = transaction_config_frame.has_pqc();
         let mut pqc_frame = PqcFrame::default();
-        let signatures_offset;
 
         if has_pqc {
-            // PQC signer 0: [2B sig_len][897B falcon_pubkey][666B falcon_sig_padded]
             const PQC_WIRE_LEN: usize = 2 + 897 + 666; // = 1565
             check_remaining(bytes, offset, PQC_WIRE_LEN)?;
 
-            let sig_len_offset = offset as u16;
-            let pubkey_offset = (offset + 2) as u16;
-            let sig_offset = (offset + 2 + 897) as u16;
-            offset = offset.wrapping_add(PQC_WIRE_LEN);
-
             pqc_frame = PqcFrame {
-                sig_len_offset,
-                pubkey_offset,
-                sig_offset,
+                sig_len_offset: offset as u16,
+                pubkey_offset: (offset + 2) as u16,
+                sig_offset: (offset + 2 + 897) as u16,
                 present: true,
             };
-
-            // The SignatureFrame for downstream (PoH, txid) will point to
-            // right after the PQC blob — where Ed25519 co-signers start.
-            signatures_offset = offset as u16;
-
-            // Remaining Ed25519 co-signers (if any)
-            if num_required_signatures > 1 {
-                advance_offset_for_array::<Signature>(
-                    bytes,
-                    &mut offset,
-                    u16::from(num_required_signatures - 1),
-                )?;
-            }
-        } else {
-            signatures_offset = offset as u16;
-            advance_offset_for_array::<Signature>(
-                bytes,
-                &mut offset,
-                u16::from(num_required_signatures),
-            )?;
+            offset = offset.wrapping_add(PQC_WIRE_LEN);
         }
 
         // Verify that the entire transaction was parsed.
@@ -213,15 +198,9 @@ impl TransactionFrame {
             return Err(TransactionViewError::ParseError);
         }
 
-        let num_ed25519_sigs = if has_pqc {
-            num_required_signatures.saturating_sub(1)
-        } else {
-            num_required_signatures
-        };
-
         let frame = Self {
             signature: SignatureFrame {
-                num_signatures: num_ed25519_sigs,
+                num_signatures: num_required_signatures,
                 offset: signatures_offset,
             },
             message_header: MessageHeaderFrame {
@@ -326,10 +305,6 @@ impl TransactionFrame {
     #[inline]
     pub(crate) fn message_range(&self) -> (u16, u16) {
         let end = match self.version() {
-            TransactionVersion::V1 if self.pqc_frame.present => {
-                // Message ends where the PQC blob starts
-                self.pqc_frame.sig_len_offset
-            }
             TransactionVersion::V1 => self.signature.offset,
             _ => self.data_len,
         };
@@ -699,6 +674,7 @@ mod tests {
                     compute_unit_limit: Some(456),
                     loaded_accounts_data_size_limit: Some(789),
                     heap_size: Some(1024),
+                    pqc: false,
                 },
                 lifetime_specifier: Hash::default(),
                 account_keys: vec![payer, other, program],

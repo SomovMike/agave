@@ -475,6 +475,7 @@ mod tests {
                     compute_unit_limit: Some(222),
                     loaded_accounts_data_size_limit: Some(333),
                     heap_size: Some(1024),
+                    pqc: false,
                 },
                 lifetime_specifier: Hash::default(),
                 account_keys: vec![payer, program],

@@ -263,6 +263,7 @@ impl From<Transaction> for generated::Transaction {
                 .map(|signature| <Signature as AsRef<[u8]>>::as_ref(&signature).into())
                 .collect(),
             message: Some(value.message.into()),
+            falcon_signer: None,
         }
     }
 }
@@ -276,12 +277,17 @@ impl From<VersionedTransaction> for generated::Transaction {
                 .map(|signature| <Signature as AsRef<[u8]>>::as_ref(&signature).into())
                 .collect(),
             message: Some(value.message.into()),
+            falcon_signer: value.falcon_signer.map(|fs| generated::FalconSigner {
+                pubkey: fs.pubkey,
+                signature: fs.signature,
+            }),
         }
     }
 }
 
 impl From<generated::Transaction> for VersionedTransaction {
     fn from(value: generated::Transaction) -> Self {
+        use solana_transaction::versioned::FalconSigner;
         Self {
             signatures: value
                 .signatures
@@ -290,6 +296,10 @@ impl From<generated::Transaction> for VersionedTransaction {
                 .collect::<Result<_, _>>()
                 .unwrap(),
             message: value.message.expect("message is required").into(),
+            falcon_signer: value.falcon_signer.map(|fs| FalconSigner {
+                pubkey: fs.pubkey,
+                signature: fs.signature,
+            }),
         }
     }
 }

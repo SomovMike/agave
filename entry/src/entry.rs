@@ -186,6 +186,7 @@ struct TxVerificationData {
     signatures: SmallVec<[Signature; 2]>,
     signer_pubkeys: SmallVec<[Address; 2]>,
     serialized_message: Vec<u8>,
+    falcon_signer: Option<solana_transaction::versioned::FalconSigner>,
 }
 
 pub struct UnverifiedSignatures {
@@ -201,14 +202,32 @@ impl UnverifiedSignatures {
 
     pub fn verify(&self) -> Result<()> {
         self.signatures.par_iter().try_for_each(|tx_signatures| {
-            if tx_signatures
+            let all_ok = tx_signatures
                 .signatures
                 .iter()
                 .zip(tx_signatures.signer_pubkeys.iter())
-                .all(|(signature, pubkey)| {
+                .enumerate()
+                .all(|(i, (signature, pubkey))| {
+                    if i == 0 {
+                        if let Some(ref falcon) = tx_signatures.falcon_signer {
+                            let auth = solana_pqc::AuthScheme::Falcon {
+                                pubkey: &falcon.pubkey,
+                                signature: &falcon.signature,
+                            };
+                            let bytes: &[u8; 32] = pubkey.as_ref()
+                                .try_into()
+                                .expect("address is 32 bytes");
+                            let account_key = solana_pubkey::Pubkey::from(*bytes);
+                            return auth.verify_signer(
+                                signature,
+                                &account_key,
+                                &tx_signatures.serialized_message,
+                            );
+                        }
+                    }
                     signature.verify(pubkey.as_ref(), &tx_signatures.serialized_message)
-                })
-            {
+                });
+            if all_ok {
                 Ok(())
             } else {
                 Err(TransactionError::SignatureFailure)
@@ -290,12 +309,22 @@ pub fn hash_signatures(signatures: &[impl AsRef<[u8]>]) -> Hash {
 }
 
 pub fn hash_transactions(transactions: &[VersionedTransaction]) -> Hash {
-    // a hash of a slice of transactions only needs to hash the signatures
-    let signatures: Vec<_> = transactions
-        .iter()
-        .flat_map(|tx| tx.signatures.iter())
-        .collect();
-    hash_signatures(&signatures)
+    let mut hash_inputs: Vec<&[u8]> = Vec::new();
+    for tx in transactions {
+        for sig in &tx.signatures {
+            hash_inputs.push(sig.as_ref());
+        }
+        if let Some(ref falcon) = tx.falcon_signer {
+            hash_inputs.push(&falcon.pubkey);
+            hash_inputs.push(&falcon.signature);
+        }
+    }
+    let merkle_tree = MerkleTree::new(&hash_inputs);
+    if let Some(root_hash) = merkle_tree.get_root() {
+        *root_hash
+    } else {
+        Hash::default()
+    }
 }
 
 fn next_hash_with_signatures(
@@ -371,12 +400,14 @@ where
             let signatures = versioned_tx.signatures.iter().copied().collect();
             let signer_pubkeys = static_account_keys[..num_signers].iter().copied().collect();
             let serialized_message = versioned_tx.message.serialize();
+            let falcon_signer = versioned_tx.falcon_signer.clone();
             let verified_transaction = verify(versioned_tx, &serialized_message)?;
             unverified_signatures.signatures.push(TxVerificationData {
                 is_simple_vote: verified_transaction.is_simple_vote_transaction(),
                 signatures,
                 serialized_message,
                 signer_pubkeys,
+                falcon_signer,
             });
 
             Ok(verified_transaction)

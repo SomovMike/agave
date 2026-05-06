@@ -11,7 +11,6 @@ use {
     },
     solana_hash::Hash,
     solana_message::{AccountKeys, v0::LoadedAddresses},
-    solana_pqc::{FalconPublicKey, FalconSignature},
     solana_pubkey::Pubkey,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_signature::Signature,
@@ -35,8 +34,6 @@ pub struct ResolvedTransactionView<D: TransactionData> {
     // Sanitized transactions are guaranteed to have a maximum of 256 keys,
     // because account indexing is done with a u8.
     writable_cache: [bool; 256],
-    /// For PQC transactions: the deterministic proxy signature used as txid.
-    pqc_proxy_signature: Option<Signature>,
 }
 
 impl<D: TransactionData> Deref for ResolvedTransactionView<D> {
@@ -81,26 +78,11 @@ impl<D: TransactionData> ResolvedTransactionView<D> {
         let writable_cache =
             Self::cache_is_writable(&view, resolved_addresses_ref, reserved_account_keys);
 
-        let pqc_proxy_signature = if view.has_pqc() {
-            Self::compute_proxy_signature(&view)
-        } else {
-            None
-        };
-
         Ok(Self {
             view,
             resolved_addresses,
             writable_cache,
-            pqc_proxy_signature,
         })
-    }
-
-    fn compute_proxy_signature(view: &TransactionView<true, D>) -> Option<Signature> {
-        let pk_bytes = view.pqc_pubkey_bytes()?;
-        let sig_bytes = view.pqc_signature_bytes()?;
-        let falcon_pk = FalconPublicKey::from_bytes(pk_bytes)?;
-        let falcon_sig = FalconSignature::from_bytes(sig_bytes)?;
-        Some(falcon_sig.to_proxy_signature(&falcon_pk))
     }
 
     /// Helper function to check if an address is writable,
@@ -259,19 +241,11 @@ impl<D: TransactionData> SVMMessage for ResolvedTransactionView<D> {
 
 impl<D: TransactionData> SVMTransaction for ResolvedTransactionView<D> {
     fn signature(&self) -> &Signature {
-        if let Some(ref proxy) = self.pqc_proxy_signature {
-            proxy
-        } else {
-            &self.view.signatures()[0]
-        }
+        &self.view.signatures()[0]
     }
 
     fn signatures(&self) -> &[Signature] {
-        if let Some(ref proxy) = self.pqc_proxy_signature {
-            core::slice::from_ref(proxy)
-        } else {
-            self.view.signatures()
-        }
+        self.view.signatures()
     }
 }
 
