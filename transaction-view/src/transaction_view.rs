@@ -297,6 +297,10 @@ impl<D: TransactionData> SVMStaticMessage for TransactionView<true, D> {
         self.num_required_signatures() as u64
     }
 
+    fn num_pqc_signatures(&self) -> u64 {
+        if self.has_pqc() { 1 } else { 0 }
+    }
+
     fn num_write_locks(&self) -> u64 {
         self.num_requested_write_locks()
     }
@@ -345,6 +349,10 @@ impl<D: TransactionData> SVMStaticMessage for &TransactionView<true, D> {
 
     fn num_transaction_signatures(&self) -> u64 {
         <TransactionView<true, D> as SVMStaticMessage>::num_transaction_signatures(self)
+    }
+
+    fn num_pqc_signatures(&self) -> u64 {
+        <TransactionView<true, D> as SVMStaticMessage>::num_pqc_signatures(self)
     }
 
     fn num_write_locks(&self) -> u64 {

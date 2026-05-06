@@ -39,6 +39,12 @@ pub trait SVMStaticMessage {
         default_precompile_signature_count(&secp256r1_program::ID, self.program_instructions_iter())
     }
 
+    /// Return the number of PQC (Falcon-512) signatures in this transaction.
+    /// PQC transactions carry higher fees due to larger wire size and verification cost.
+    fn num_pqc_signatures(&self) -> u64 {
+        0
+    }
+
     /// Returns the number of requested write-locks in this message.
     /// This does not consider if write-locks are demoted.
     fn num_write_locks(&self) -> u64;

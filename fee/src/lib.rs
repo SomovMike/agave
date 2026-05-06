@@ -47,6 +47,11 @@ pub fn calculate_fee_details(
     )
 }
 
+/// Fee multiplier for PQC (Falcon-512) signatures.
+/// PQC transactions are ~8x larger on the wire and require lattice-based
+/// verification, justifying a higher fee.
+const PQC_FEE_MULTIPLIER: u64 = 10;
+
 /// Calculate fees from signatures.
 pub fn calculate_signature_fee(
     SignatureCounts {
@@ -54,14 +59,20 @@ pub fn calculate_signature_fee(
         num_ed25519_signatures,
         num_secp256k1_signatures,
         num_secp256r1_signatures,
+        num_pqc_signatures,
     }: SignatureCounts,
     lamports_per_signature: u64,
 ) -> u64 {
-    let signature_count = num_transaction_signatures
+    let standard_count = num_transaction_signatures
         .saturating_add(num_ed25519_signatures)
         .saturating_add(num_secp256k1_signatures)
         .saturating_add(num_secp256r1_signatures);
-    signature_count.saturating_mul(lamports_per_signature)
+    let pqc_fee = num_pqc_signatures
+        .saturating_mul(PQC_FEE_MULTIPLIER)
+        .saturating_mul(lamports_per_signature);
+    standard_count
+        .saturating_mul(lamports_per_signature)
+        .saturating_add(pqc_fee)
 }
 
 pub struct SignatureCounts {
@@ -69,6 +80,7 @@ pub struct SignatureCounts {
     pub num_ed25519_signatures: u64,
     pub num_secp256k1_signatures: u64,
     pub num_secp256r1_signatures: u64,
+    pub num_pqc_signatures: u64,
 }
 
 impl<Tx: SVMStaticMessage> From<&Tx> for SignatureCounts {
@@ -78,6 +90,7 @@ impl<Tx: SVMStaticMessage> From<&Tx> for SignatureCounts {
             num_ed25519_signatures: message.num_ed25519_signatures(),
             num_secp256k1_signatures: message.num_secp256k1_signatures(),
             num_secp256r1_signatures: message.num_secp256r1_signatures(),
+            num_pqc_signatures: message.num_pqc_signatures(),
         }
     }
 }
@@ -98,6 +111,7 @@ mod tests {
                     num_ed25519_signatures: 0,
                     num_secp256k1_signatures: 0,
                     num_secp256r1_signatures: 0,
+                    num_pqc_signatures: 0,
                 },
                 LAMPORTS_PER_SIGNATURE,
             ),
@@ -112,6 +126,7 @@ mod tests {
                     num_ed25519_signatures: 0,
                     num_secp256k1_signatures: 0,
                     num_secp256r1_signatures: 0,
+                    num_pqc_signatures: 0,
                 },
                 LAMPORTS_PER_SIGNATURE,
             ),
@@ -126,10 +141,26 @@ mod tests {
                     num_ed25519_signatures: 2,
                     num_secp256k1_signatures: 3,
                     num_secp256r1_signatures: 4,
+                    num_pqc_signatures: 0,
                 },
                 LAMPORTS_PER_SIGNATURE,
             ),
             10 * LAMPORTS_PER_SIGNATURE
+        );
+
+        // PQC signature (10x multiplier).
+        assert_eq!(
+            calculate_signature_fee(
+                SignatureCounts {
+                    num_transaction_signatures: 1,
+                    num_ed25519_signatures: 0,
+                    num_secp256k1_signatures: 0,
+                    num_secp256r1_signatures: 0,
+                    num_pqc_signatures: 1,
+                },
+                LAMPORTS_PER_SIGNATURE,
+            ),
+            LAMPORTS_PER_SIGNATURE + 10 * LAMPORTS_PER_SIGNATURE
         );
     }
 }

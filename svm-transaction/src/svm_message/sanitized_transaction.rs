@@ -19,6 +19,10 @@ impl SVMStaticMessage for SanitizedTransaction {
         SVMStaticMessage::num_transaction_signatures(SanitizedTransaction::message(self))
     }
 
+    fn num_pqc_signatures(&self) -> u64 {
+        SVMStaticMessage::num_pqc_signatures(SanitizedTransaction::message(self))
+    }
+
     fn num_write_locks(&self) -> u64 {
         SVMStaticMessage::num_write_locks(SanitizedTransaction::message(self))
     }

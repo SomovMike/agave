@@ -83,6 +83,10 @@ impl<T: SVMStaticMessage> SVMStaticMessage for RuntimeTransaction<T> {
     fn num_transaction_signatures(&self) -> u64 {
         self.transaction.num_transaction_signatures()
     }
+
+    fn num_pqc_signatures(&self) -> u64 {
+        self.transaction.num_pqc_signatures()
+    }
     // override to access from the cached meta instead of re-calculating
     fn num_ed25519_signatures(&self) -> u64 {
         self.meta

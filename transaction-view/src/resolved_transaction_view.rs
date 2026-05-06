@@ -167,6 +167,10 @@ impl<D: TransactionData> SVMStaticMessage for ResolvedTransactionView<D> {
         u64::from(self.view.num_required_signatures())
     }
 
+    fn num_pqc_signatures(&self) -> u64 {
+        if self.view.has_pqc() { 1 } else { 0 }
+    }
+
     fn num_write_locks(&self) -> u64 {
         self.view.num_requested_write_locks()
     }

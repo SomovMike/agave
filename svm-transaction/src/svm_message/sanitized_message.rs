@@ -23,6 +23,15 @@ impl SVMStaticMessage for SanitizedMessage {
         u64::from(self.header().num_required_signatures)
     }
 
+    fn num_pqc_signatures(&self) -> u64 {
+        match self {
+            SanitizedMessage::V1(cached_msg) => {
+                if cached_msg.message.config.pqc { 1 } else { 0 }
+            }
+            _ => 0,
+        }
+    }
+
     fn num_write_locks(&self) -> u64 {
         SanitizedMessage::num_write_locks(self)
     }
